@@ -1,0 +1,76 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: pip install customtkinter matplotlib numpy pyinstaller
+
+      - name: Build exe with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed `
+            --collect-all customtkinter `
+            --collect-all matplotlib `
+            --hidden-import numpy `
+            --icon asiair_sorter.ico `
+            --name ASIAIR_Sorter `
+            asiair_sorter.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer
+        run: |
+          New-Item -ItemType Directory -Force installer_output
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\asiair_sorter_setup.iss
+
+      - name: Upload standalone exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASIAIR_Sorter-portable
+          path: dist\ASIAIR_Sorter.exe
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ASIAIR_Sorter-installer
+          path: installer_output\ASIAIR_Sorter_Setup_v*.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ASIAIR Session Sorter ${{ github.ref_name }}
+          body: |
+            ## ASIAIR Session Sorter ${{ github.ref_name }}
+
+            ### Downloads
+            | File | Description |
+            |------|-------------|
+            | `ASIAIR_Sorter_Setup_v*.exe` | **Recommended** — full Windows installer with Start Menu shortcut and uninstaller |
+            | `ASIAIR_Sorter.exe` | Portable — run directly, no install needed |
+
+            No Python required for either option.
+
+            ### What's new
+            See [commits](https://github.com/pulikantitarun/asiair-sorter/commits/${{ github.ref_name }}) for changes since last release.
+          files: |
+            installer_output\ASIAIR_Sorter_Setup_v*.exe
+            dist\ASIAIR_Sorter.exe

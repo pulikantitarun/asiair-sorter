@@ -3,12 +3,14 @@
 ; ============================================================
 
 #define AppName      "ASIAIR Session Sorter"
-#define AppVersion   "2.0"
-#define AppPublisher "ASIAIR Tools"
+#define AppVersion   "2.2"
+#define AppPublisher "pulikantitarun"
 #define AppExeName   "ASIAIR_Sorter.exe"
-#define SourceExe    "C:\Users\tarun\OneDrive\Desktop\ASIAIR_Sorter.exe"
-#define AppIcon      "C:\Users\tarun\AppData\Roaming\Claude\local-agent-mode-sessions\627418e8-266b-44af-a340-38b4fb37bcfa\e63565e1-7585-401b-9a60-88360cdb7765\local_0180ef31-fdc3-4b3c-a9a5-368349f2950c\outputs\asiair_sorter.ico"
-#define OutputDir    "C:\Users\tarun\OneDrive\Desktop"
+
+; Paths relative to this .iss file (works locally and in CI)
+#define SourceExe    "..\dist\ASIAIR_Sorter.exe"
+#define AppIcon      "..\asiair_sorter.ico"
+#define OutputDir    "..\installer_output"
 
 [Setup]
 AppId={{8F3A2C1B-4D6E-4F7A-9B2C-1E5D8F3A2C1B}
