@@ -9,8 +9,11 @@ A Windows desktop app that organises your **ZWO ASIAIR** SD card data into a cle
 ## Features
 
 - **One-click sorting** — picks up the Asiair's own folder structure (Light/Dark/Flat/Bias, filter subfolders, target names) so nothing gets misclassified
+- **Target folders from filenames** — reads `Light_<target>_<exposure>s_Bin...` names so mixed-target source folders are separated correctly
 - **JPG preview cleanup** — deletes Asiair's preview JPEGs from the SD card without copying them to your archive
 - **PHD2 log viewer** — load any PHD2 guide log and see interactive RA/Dec error graphs, star SNR, dither markers, and per-session RMS/peak-error stats
+- **Automatic PHD2 log library** — copies new or changed guide/debug logs from the remembered ASIAIR source, refreshes every 60 seconds, and opens the newest guide log automatically
+- **Detailed guiding analysis** — equipment, algorithms, sky position, RMS/median/P95/peak error, drift, correction pulses, cadence, dithers, SNR, star mass, HFD, lost-star reasons, and session events
 - **Move or copy** — copy keeps the SD card intact; move clears it out
 - **Dry run** — preview every action before touching a single file
 - **Dark themed UI** — built with customtkinter
@@ -23,20 +26,28 @@ A Windows desktop app that organises your **ZWO ASIAIR** SD card data into a cle
   Sessions/
     2026-07-11/
       PHD2_Logs/
-      M31/
-        Lights/
-          Ha/
-          OIII/
-        Darks/
-        Flats/
-      NGC7000/
-        Lights/
-          SII/
+      533MM/
+        M31/
+          Lights/
+            Ha/
+            OIII/
+        NGC7000/
+          Lights/
+            SII/
 ```
 
 ---
 
 ## Installation
+
+Pre-built downloads are available for Windows, macOS and Linux from the
+[latest release](https://github.com/pulikantitarun/asiair-sorter/releases/latest).
+
+- **Windows:** use `ASIAIR_Sorter_Setup_v2.3.exe`. It replaces an older
+  installation in place while retaining saved source/destination settings.
+- **macOS:** unzip `ASIAIR_Sorter_macOS_v2.3.zip`, then open the app bundle.
+- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v2.3.tar.gz`, make the binary
+  executable if required, and run `ASIAIR_Sorter`.
 
 ### Pre-built Windows installer (recommended)
 

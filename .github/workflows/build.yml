@@ -1,4 +1,4 @@
-name: Build
+name: Build and release
 
 on:
   push:
@@ -8,22 +8,18 @@ on:
     branches: [master]
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: pip install customtkinter matplotlib numpy pyinstaller
-
-      - name: Build exe with PyInstaller
+      - name: Run tests
+        run: python -m unittest discover -p "test_*.py"
+      - name: Build portable application
         run: |
           pyinstaller --onefile --windowed `
             --collect-all customtkinter `
@@ -32,45 +28,103 @@ jobs:
             --icon asiair_sorter.ico `
             --name ASIAIR_Sorter `
             asiair_sorter.py
-
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress
-
-      - name: Build Windows installer
+      - name: Build installer
         run: |
           New-Item -ItemType Directory -Force installer_output
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\asiair_sorter_setup.iss
-
-      - name: Upload standalone exe
-        uses: actions/upload-artifact@v4
+      - name: Stage Windows files
+        run: |
+          New-Item -ItemType Directory -Force release
+          Copy-Item dist\ASIAIR_Sorter.exe release\ASIAIR_Sorter_Windows_Portable_v2.3.exe
+          Copy-Item installer_output\ASIAIR_Sorter_Setup_v2.3.exe release\ASIAIR_Sorter_Setup_v2.3.exe
+          Get-FileHash release\* -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } | Set-Content release\SHA256SUMS-Windows.txt
+      - uses: actions/upload-artifact@v4
         with:
-          name: ASIAIR_Sorter-portable
-          path: dist\ASIAIR_Sorter.exe
+          name: ASIAIR-Sorter-Windows
+          path: release/*
 
-      - name: Upload installer
-        uses: actions/upload-artifact@v4
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          name: ASIAIR_Sorter-installer
-          path: installer_output\ASIAIR_Sorter_Setup_v*.exe
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install customtkinter matplotlib numpy pyinstaller
+      - name: Run tests
+        run: python -m unittest discover -p 'test_*.py'
+      - name: Build macOS application
+        run: |
+          pyinstaller --noconfirm --clean --windowed \
+            --collect-all customtkinter \
+            --collect-all matplotlib \
+            --hidden-import numpy \
+            --name ASIAIR_Sorter \
+            asiair_sorter.py
+          ditto -c -k --sequesterRsrc --keepParent dist/ASIAIR_Sorter.app ASIAIR_Sorter_macOS_v2.3.zip
+          shasum -a 256 ASIAIR_Sorter_macOS_v2.3.zip > SHA256SUMS-macOS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ASIAIR-Sorter-macOS
+          path: |
+            ASIAIR_Sorter_macOS_v2.3.zip
+            SHA256SUMS-macOS.txt
 
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install desktop runtime
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install customtkinter matplotlib numpy pyinstaller
+      - name: Run tests
+        run: python -m unittest discover -p 'test_*.py'
+      - name: Build Linux application
+        run: |
+          python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+          pyinstaller --noconfirm --clean --onefile --windowed \
+            --collect-all customtkinter \
+            --collect-all matplotlib \
+            --hidden-import numpy \
+            --name ASIAIR_Sorter \
+            asiair_sorter.py
+          chmod +x dist/ASIAIR_Sorter
+          tar -C dist -czf ASIAIR_Sorter_Linux_x86_64_v2.3.tar.gz ASIAIR_Sorter
+          sha256sum ASIAIR_Sorter_Linux_x86_64_v2.3.tar.gz > SHA256SUMS-Linux.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ASIAIR-Sorter-Linux
+          path: |
+            ASIAIR_Sorter_Linux_x86_64_v2.3.tar.gz
+            SHA256SUMS-Linux.txt
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ASIAIR-Sorter-*
+          path: release
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
         with:
           name: ASIAIR Session Sorter ${{ github.ref_name }}
           body: |
-            ## ASIAIR Session Sorter ${{ github.ref_name }}
+            ASIAIR Session Sorter 2.3 adds target-aware light-frame folders,
+            the Date > Camera > Target > Lights structure, and an automatic,
+            detailed PHD2 log library and viewer.
 
-            ### Downloads
-            | File | Description |
-            |------|-------------|
-            | `ASIAIR_Sorter_Setup_v*.exe` | **Recommended** — full Windows installer with Start Menu shortcut and uninstaller |
-            | `ASIAIR_Sorter.exe` | Portable — run directly, no install needed |
-
-            No Python required for either option.
-
-            ### What's new
-            See [commits](https://github.com/pulikantitarun/asiair-sorter/commits/${{ github.ref_name }}) for changes since last release.
-          files: |
-            installer_output\ASIAIR_Sorter_Setup_v*.exe
-            dist\ASIAIR_Sorter.exe
+            The Windows installer upgrades an existing installation in place
+            and preserves saved source and destination settings.
+          files: release/*

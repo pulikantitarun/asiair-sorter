@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         ASIAIR Astrophotography Session Sorter  v2.2         ║
+║         ASIAIR Astrophotography Session Sorter  v2.3         ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage (from source):
@@ -22,6 +22,11 @@ Building a standalone Windows exe:
 import sys, subprocess
 
 def _pip(*pkgs):
+    if getattr(sys, "frozen", False):
+        raise RuntimeError(
+            "A bundled dependency could not be loaded. Reinstall ASIAIR Sorter "
+            "instead of attempting an in-app package installation."
+        )
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + list(pkgs))
 
 try:
@@ -48,6 +53,7 @@ except ImportError:
 
 # ── Standard library ──────────────────────────────────────────────────────────
 import json, os, re, shutil, threading, tkinter as tk
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -67,11 +73,22 @@ PHD2_FOLDER     = "PHD2_Logs"
 IMAGING_EXTENSIONS = frozenset({".fits", ".fit", ".fts"})
 PREVIEW_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff"})
 PHD2_EXTENSIONS    = frozenset({".log", ".txt"})
-KNOWN_FILTERS      = ["OIII", "SII", "Hb", "Ha", "Lum", "RGB", "R", "G", "B", "L"]
+KNOWN_FILTERS      = ["OIII", "SII", "Hb", "Ha", "Lum", "RGB", "H", "O", "S", "R", "G", "B", "L"]
 
 CONFIG_PATH = Path.home() / ".asiair_sorter_config.json"
 _DATE_RE    = re.compile(r"(\d{4}-\d{2}-\d{2})")
-VERSION     = "2.2"
+_COMPACT_DATE_RE = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?=[-_])")
+_DMY_DATE_RE = re.compile(r"(?<!\d)(\d{2})-(\d{2})-(20\d{2})(?!\d)")
+_LIGHT_TARGET_RE = re.compile(
+    r"^Light_(?P<target>.+?)_\d+(?:\.\d+)?s_Bin\d+(?:_|$)",
+    re.IGNORECASE,
+)
+_LIGHT_CAMERA_RE = re.compile(
+    r"^Light_.+?_\d+(?:\.\d+)?s_Bin\d+_(?P<middle>.+?)_gain[-+]?\d+",
+    re.IGNORECASE,
+)
+_INVALID_FOLDER_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
+VERSION     = "2.3"
 
 # ── UI palette ────────────────────────────────────────────────────────────────
 BG_APP     = "#0d1117"
@@ -122,18 +139,64 @@ def _rel_parts(fp: Path, root: Path) -> list:
     return list(rel.parts)[:-1]
 
 def _find_date(parts: list, filename: str) -> str:
+    # The capture timestamp in an ASIAIR filename is more precise than a
+    # containing folder and avoids assigning overnight files to today's date.
+    compact = _COMPACT_DATE_RE.search(filename)
+    if compact:
+        return f"{compact.group(1)}-{compact.group(2)}-{compact.group(3)}"
     for seg in reversed(parts):
         m = _DATE_RE.search(seg)
         if m: return m.group(1)
+        dmy = _DMY_DATE_RE.search(seg)
+        if dmy: return f"{dmy.group(3)}-{dmy.group(2)}-{dmy.group(1)}"
     m = _DATE_RE.search(filename)
     return m.group(1) if m else datetime.now().strftime("%Y-%m-%d")
 
-def _find_target(parts: list):
+def _safe_folder_name(value: str):
+    """Return a Windows-safe target folder name without changing its identity."""
+    value = _INVALID_FOLDER_CHARS_RE.sub("_", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value:
+        return None
+    # Avoid Windows device names such as CON, PRN, COM1, and LPT1.
+    if re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])", value):
+        value += "_"
+    return value[:120].rstrip(" .") or None
+
+def _find_target_from_filename(filename: str):
+    """Extract the ASIAIR target from Light_<target>_<exposure>s_Bin... names."""
+    match = _LIGHT_TARGET_RE.match(Path(filename).stem)
+    if not match:
+        return None
+    return _safe_folder_name(match.group("target"))
+
+def _find_target(parts: list, filename: str = ""):
+    # ASIAIR writes the target into each light filename. Prefer that value so
+    # mixed-target source folders cannot collapse into one destination Lights
+    # folder. Older layouts still fall back to Autorun/<target>.
+    from_filename = _find_target_from_filename(filename)
+    if from_filename:
+        return from_filename
     for i, p in enumerate(parts):
         if p.lower() == "autorun" and i + 1 < len(parts):
             c = parts[i + 1]
-            if not _DATE_RE.match(c): return c
+            if not _DATE_RE.match(c): return _safe_folder_name(c)
     return None
+
+def _find_camera_and_filter_from_filename(filename: str):
+    """Return camera and optional filter from ASIAIR light filenames."""
+    match = _LIGHT_CAMERA_RE.match(Path(filename).stem)
+    if not match: return None, None
+    pieces = match.group("middle").split("_")
+    filter_name = None
+    if len(pieces) > 1:
+        for known in KNOWN_FILTERS:
+            if pieces[-1].lower() == known.lower():
+                filter_name = known
+                pieces.pop()
+                break
+    camera = _safe_folder_name("_".join(pieces))
+    return camera, filter_name
 
 def _find_frame_type(parts: list) -> str:
     _map = {"light":"Light","lights":"Light","dark":"Dark","darks":"Dark",
@@ -165,16 +228,23 @@ def classify_file(fp: Path, src_root: Path):
         return None
     if ext in IMAGING_EXTENSIONS:
         ft = _find_frame_type(parts)
+        camera, filename_filter = _find_camera_and_filter_from_filename(filename) if ft=="Light" else (None,None)
         return {"action":"copy_fits","frame_type":ft,
-                "date":_find_date(parts,filename),"target":_find_target(parts),
-                "filter_name":_find_filter(parts) if ft=="Light" else None}
+                "date":_find_date(parts,filename),
+                "target":_find_target(parts, filename) if ft=="Light" else None,
+                "camera":camera,
+                "filter_name":filename_filter or (_find_filter(parts) if ft=="Light" else None)}
     return None
 
 def build_dest_path(info: dict, dst_root: Path, filename: str) -> Path:
     base = dst_root / SESSIONS_ROOT / info["date"]
     if info["action"] == "copy_phd2":
         return base / PHD2_FOLDER / filename
-    if info["target"]: base = base / info["target"]
+    if info["frame_type"] == "Light":
+        base = base / (info.get("camera") or "Unknown Camera")
+        base = base / (info.get("target") or "Unknown Target")
+    elif info.get("target"):
+        base = base / info["target"]
     folder_map = {"Light":LIGHTS_FOLDER,"Dark":DARKS_FOLDER,
                   "Flat":FLATS_FOLDER,"Bias":BIAS_FOLDER}
     base = base / folder_map.get(info["frame_type"], info["frame_type"])
@@ -205,6 +275,7 @@ def save_config(cfg: dict):
 
 # ── Session summary ───────────────────────────────────────────────────────────
 def write_session_summary(session_dir: Path, date: str, target,
+                           camera,
                            entries: list, action: str):
     by_type: dict = {}
     for info, src, dst in entries:
@@ -215,6 +286,7 @@ def write_session_summary(session_dir: Path, date: str, target,
         f.write("ASIAIR Session Summary\n" + "="*44 + "\n")
         f.write(f"Generated : {datetime.now():%Y-%m-%d %H:%M:%S}\n")
         f.write(f"Date      : {date}\n")
+        if camera: f.write(f"Camera    : {camera}\n")
         if target: f.write(f"Target    : {target}\n")
         f.write(f"Operation : {action}\n")
         for (ft, fn), files in sorted(by_type.items()):
@@ -228,20 +300,36 @@ def write_session_summary(session_dir: Path, date: str, target,
 
 @dataclass
 class PHD2Session:
+    source_path: str = ""
     start_time: str = ""
     end_time:   str = ""
+    phd_version: str = ""
     profile:    str = ""
     camera:     str = ""
     mount:      str = ""
+    aux_mount:  str = ""
     focal_mm:   Optional[float] = None
     px_scale:   Optional[float] = None     # arcsec/px
+    exposure_s: Optional[float] = None
     units:      str = "arcsec"             # or "px"
+    sky_position: str = ""
+    lock_position: str = ""
+    header: dict = field(default_factory=dict)
+    algorithms: dict = field(default_factory=dict)
+    events: list = field(default_factory=list)
 
     times:     list = field(default_factory=list)
     ra_err:    list = field(default_factory=list)
     dec_err:   list = field(default_factory=list)
     snr:       list = field(default_factory=list)
+    star_mass: list = field(default_factory=list)
+    hfd:       list = field(default_factory=list)
     avg_dist:  list = field(default_factory=list)
+    ra_pulse:  list = field(default_factory=list)
+    dec_pulse: list = field(default_factory=list)
+    ra_dir:    list = field(default_factory=list)
+    dec_dir:   list = field(default_factory=list)
+    error_codes: list = field(default_factory=list)
     dithers:   list = field(default_factory=list)   # times of dither events (sec)
 
     def finalise(self):
@@ -250,7 +338,12 @@ class PHD2Session:
         self.ra_err   = np.array(self.ra_err,  dtype=float)
         self.dec_err  = np.array(self.dec_err, dtype=float)
         self.snr      = np.array(self.snr,     dtype=float) if self.snr     else np.array([])
+        self.star_mass= np.array(self.star_mass,dtype=float) if self.star_mass else np.array([])
+        self.hfd      = np.array(self.hfd,     dtype=float) if self.hfd     else np.array([])
         self.avg_dist = np.array(self.avg_dist,dtype=float) if self.avg_dist else np.array([])
+        self.ra_pulse = np.array(self.ra_pulse,dtype=float) if self.ra_pulse else np.array([])
+        self.dec_pulse= np.array(self.dec_pulse,dtype=float) if self.dec_pulse else np.array([])
+        self.error_codes = np.array(self.error_codes,dtype=int) if self.error_codes else np.array([],dtype=int)
         self.dithers  = np.array(self.dithers, dtype=float) if self.dithers  else np.array([])
 
     @property
@@ -279,6 +372,40 @@ class PHD2Session:
         if not len(self.ra_err): return 0
         return float(np.max(np.sqrt(self.ra_err**2 + self.dec_err**2)))
 
+    @property
+    def median_err(self) -> float:
+        if not len(self.ra_err): return 0
+        return float(np.median(np.sqrt(self.ra_err**2 + self.dec_err**2)))
+
+    @property
+    def p95_err(self) -> float:
+        if not len(self.ra_err): return 0
+        return float(np.percentile(np.sqrt(self.ra_err**2 + self.dec_err**2), 95))
+
+    @property
+    def cadence_s(self) -> float:
+        return float(np.median(np.diff(self.times))) if len(self.times) > 1 else 0
+
+    @property
+    def lost_frames(self) -> int:
+        return int(np.count_nonzero(self.error_codes)) if len(self.error_codes) else 0
+
+    def drift_per_min(self, axis: str) -> float:
+        values = self.ra_err if axis == "ra" else self.dec_err
+        if len(values) < 2 or self.duration_min <= 0: return 0
+        return float(np.polyfit((self.times-self.times[0])/60, values, 1)[0])
+
+
+PHD2_ERROR_LABELS = {
+    0: "No error", 1: "Saturated star", 2: "Low SNR",
+    3: "Low star mass", 4: "HFD below minimum", 5: "HFD above maximum",
+    6: "Star near frame edge", 7: "Star mass changed", 8: "Unexpected error",
+}
+
+def _number(text: str):
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text or "")
+    return float(m.group(0)) if m else None
+
 
 def parse_phd2_log(path: str) -> List[PHD2Session]:
     """Return a list of PHD2Session objects (one per Guiding Begins block)."""
@@ -287,6 +414,7 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
     in_data   = False
     col: dict = {}
     use_arcsec = True
+    file_version = ""
 
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         for raw in fh:
@@ -294,9 +422,12 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
             if not line: continue
             lo = line.lower()
 
+            if "phd2 version" in lo:
+                file_version = line
+
             # ── New guiding block ─────────────────────────────────────
             if "guiding begins" in lo or "guiding_begins" in lo:
-                cur = PHD2Session()
+                cur = PHD2Session(source_path=str(path), phd_version=file_version)
                 tm = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", line)
                 if tm: cur.start_time = f"{tm.group(1)} {tm.group(2)}"
                 else:
@@ -312,15 +443,32 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
             if "=" in line and not in_data:
                 k, _, v = line.partition("=")
                 k, v = k.strip().lower(), v.strip()
+                cur.header[k] = v
                 if "equipment profile" in k: cur.profile  = v
                 elif k == "camera":          cur.camera   = v
                 elif k == "mount":           cur.mount    = v
+                elif "aux mount" in k:       cur.aux_mount= v
                 elif "focal length" in k:
-                    m = re.search(r"([\d.]+)", v)
-                    if m: cur.focal_mm = float(m.group(1))
+                    cur.focal_mm = _number(v)
                 elif "image scale" in k or "pixel scale" in k:
-                    m = re.search(r"([\d.]+)", v)
-                    if m: cur.px_scale = float(m.group(1))
+                    cur.px_scale = _number(v)
+                elif "exposure" in k:
+                    val = _number(v)
+                    if val is not None:
+                        cur.exposure_s = val / 1000 if "ms" in v.lower() else val
+                if "guide algorithm" in k or any(
+                    token in k for token in ("aggression", "minimum move", "hysteresis",
+                                              "max ra duration", "max dec duration",
+                                              "dec guide mode", "backlash")
+                ):
+                    cur.algorithms[k] = v
+                continue
+
+            if not in_data and lo.startswith("ra ="):
+                cur.sky_position = line
+                continue
+            if not in_data and lo.startswith("lock position"):
+                cur.lock_position = line
                 continue
 
             # ── Column header ─────────────────────────────────────────
@@ -329,7 +477,7 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
                 cols = [c.strip() for c in line.split(",")]
                 col  = {name: i for i, name in enumerate(cols)}
                 use_arcsec = "RARawError" in col and "DECRawError" in col
-                cur.units  = "arcsec" if use_arcsec else "px"
+                cur.units  = "arcsec" if use_arcsec or cur.px_scale else "px"
                 continue
 
             # ── End of guiding block ──────────────────────────────────
@@ -339,7 +487,9 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
                 if tm and cur: cur.end_time = tm.group(1)
                 continue
 
-            # ── Dither events (record time of last frame) ─────────────
+            # ── Session events ────────────────────────────────────────
+            if in_data and cur and not line.split(",",1)[0].strip().isdigit():
+                cur.events.append(line)
             if in_data and cur and "dither" in lo:
                 if cur.times:
                     cur.dithers.append(cur.times[-1])
@@ -359,19 +509,42 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
                                 except ValueError: pass
                     return None
 
+                def _f_any(*names):
+                    for name in names:
+                        value = _f(name)
+                        if value is not None: return value
+                    return None
+
+                def _s(name):
+                    if name in col and col[name] < len(parts):
+                        return parts[col[name]].strip().strip('"')
+                    return ""
+
                 t = _f("Time")
                 if t is None: continue
-                ra  = _f("RARawError") if use_arcsec else _f("dx")
-                dec = _f("DECRawError") if use_arcsec else _f("dy")
+                ra  = _f_any("RARawError", "RARawDistance", "dx")
+                dec = _f_any("DECRawError", "DECRawDistance", "dy")
                 if ra is None or dec is None: continue
+                if not use_arcsec and cur.px_scale:
+                    ra *= cur.px_scale
+                    dec *= cur.px_scale
 
                 cur.times.append(t)
                 cur.ra_err.append(ra)
                 cur.dec_err.append(dec)
                 snr = _f("SNR")
-                if snr is not None: cur.snr.append(snr)
+                cur.snr.append(snr if snr is not None else float("nan"))
+                mass = _f("StarMass")
+                cur.star_mass.append(mass if mass is not None else float("nan"))
+                hfd = _f("HFD")
+                cur.hfd.append(hfd if hfd is not None else float("nan"))
                 ad = _f("Avg Dist")
-                if ad is not None: cur.avg_dist.append(ad)
+                cur.avg_dist.append(ad if ad is not None else float("nan"))
+                cur.ra_pulse.append(_f("RADuration") or 0)
+                cur.dec_pulse.append(_f("DECDuration") or 0)
+                cur.ra_dir.append(_s("RADirection"))
+                cur.dec_dir.append(_s("DECDirection"))
+                cur.error_codes.append(int(_f("ErrorCode") or 0))
 
     result = []
     for s in sessions:
@@ -379,6 +552,52 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
             s.finalise()
             result.append(s)
     return result
+
+
+def discover_phd2_logs(root: Path, include_debug=True) -> List[Path]:
+    """Find PHD2 guide/debug logs below an ASIAIR source or archive folder."""
+    if not root or not root.is_dir(): return []
+    found = []
+    for rd, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in names:
+            lo = name.lower()
+            if not lo.endswith((".txt", ".log")): continue
+            is_guide = "guidelog" in lo or "guide_log" in lo
+            is_debug = "debuglog" in lo or "debug_log" in lo
+            in_phd = "phd2" in str(Path(rd)).lower()
+            if is_guide or (include_debug and is_debug) or (in_phd and "guide" in lo):
+                found.append(Path(rd) / name)
+    return sorted(found, key=lambda p: (p.stat().st_mtime, str(p)), reverse=True)
+
+
+def _phd2_log_date(path: Path) -> str:
+    match = _DATE_RE.search(str(path))
+    if match: return match.group(1)
+    compact = re.search(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", path.name)
+    if compact: return f"{compact.group(1)}-{compact.group(2)}-{compact.group(3)}"
+    return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+
+
+def sync_phd2_logs(source: Path, destination: Path):
+    """Copy new/changed PHD2 logs into the archive without making duplicates."""
+    copied, updated, unchanged, errors = [], [], [], []
+    for src in discover_phd2_logs(source, include_debug=True):
+        date = _phd2_log_date(src)
+        dst = destination / SESSIONS_ROOT / date / PHD2_FOLDER / src.name
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            exists = dst.exists()
+            same = (exists and src.stat().st_size == dst.stat().st_size and
+                    src.stat().st_mtime <= dst.stat().st_mtime + 0.001)
+            if same:
+                unchanged.append(dst)
+                continue
+            shutil.copy2(str(src), str(dst))
+            (updated if exists else copied).append(dst)
+        except OSError as exc:
+            errors.append((src, str(exc)))
+    return {"copied":copied, "updated":updated, "unchanged":unchanged, "errors":errors}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHD2 Viewer UI
@@ -418,36 +637,55 @@ class PHD2ViewerFrame(ctk.CTkFrame):
     def __init__(self, parent):
         super().__init__(parent, fg_color="transparent")
         self._sessions: List[PHD2Session] = []
+        self._library_paths = {}
+        self._syncing = False
+        self._auto_sync_var = tk.BooleanVar(value=True)
         self._fig = self._canvas = self._toolbar = None
         self._ax_err = self._ax_snr = None
         self._build_ui()
+        self.after(250, self._initialise_library)
+        self.after(60000, self._auto_sync_tick)
 
     # ── Build ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # File picker
+        # Automatic log library / sync controls
         picker = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10)
         picker.pack(fill="x", pady=(0,8))
         row = ctk.CTkFrame(picker, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=12)
         row.columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(row, text="PHD2 Guide Log:",
+        ctk.CTkLabel(row, text="PHD2 Log Library:",
                      font=ctk.CTkFont(size=12, weight="bold"),
                      text_color=FG_TEXT).grid(row=0, column=0, sticky="w", padx=(0,10))
 
-        self._log_var = tk.StringVar()
-        ctk.CTkEntry(row, textvariable=self._log_var,
-                     placeholder_text="Browse for a PHD2 .txt or .log file…",
-                     fg_color=BG_INPUT, border_color=BORDER,
-                     text_color=FG_TEXT, placeholder_text_color=FG_MUTED,
-                     height=34).grid(row=0, column=1, sticky="ew", padx=(0,8))
+        self._log_var = tk.StringVar(value="No archived guide logs found")
+        self._log_combo = ctk.CTkComboBox(
+            row, variable=self._log_var, values=["No archived guide logs found"],
+            fg_color=BG_INPUT, border_color=BORDER, text_color=FG_TEXT,
+            button_color=ACCENT, button_hover_color=ACCENT_HL,
+            height=34, command=lambda _value: self._load())
+        self._log_combo.grid(row=0, column=1, sticky="ew", padx=(0,8))
 
-        ctk.CTkButton(row, text="Browse…", width=80, height=34,
-                      command=self._browse).grid(row=0, column=2, padx=(0,6))
-        ctk.CTkButton(row, text="Load", width=70, height=34,
+        ctk.CTkButton(row, text="Sync Logs", width=84, height=34,
+                      command=self._sync_logs).grid(row=0, column=2, padx=(0,6))
+        ctk.CTkButton(row, text="Refresh", width=72, height=34,
+                      command=lambda: self.refresh_library()).grid(row=0, column=3, padx=(0,6))
+        ctk.CTkButton(row, text="Browse…", width=72, height=34,
+                      command=self._browse).grid(row=0, column=4, padx=(0,6))
+        ctk.CTkButton(row, text="Load", width=64, height=34,
                       fg_color=ACCENT, hover_color=ACCENT_HL,
-                      command=self._load).grid(row=0, column=3)
+                      command=self._load).grid(row=0, column=5)
+
+        self._sync_lbl = ctk.CTkLabel(
+            picker, text="Logs are copied from the remembered ASIAIR source into the archive.",
+            font=ctk.CTkFont(size=10), text_color=FG_MUTED, anchor="w")
+        self._sync_lbl.pack(side="left", fill="x", expand=True, padx=(16,8), pady=(0,8))
+        ctk.CTkCheckBox(picker, text="Auto-sync every 60s",
+                        variable=self._auto_sync_var, width=150,
+                        font=ctk.CTkFont(size=10), text_color=FG_MUTED,
+                        border_color=BORDER).pack(side="right", padx=(0,16), pady=(0,8))
 
         # Stats bar
         stats = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10)
@@ -456,11 +694,12 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         si.pack(fill="x", padx=16, pady=10)
 
         self._sb = {}
-        labels = ["RA RMS","Dec RMS","Total RMS","Peak Error","Duration","Frames"]
+        labels = ["RA RMS","Dec RMS","Total RMS","P95 Error","Peak Error","Duration",
+                  "Frames","Cadence","Dithers","Lost Frames","Avg SNR","Avg HFD"]
         for i, lbl in enumerate(labels):
             sb = StatBox(si, lbl)
-            sb.grid(row=0, column=i, padx=4, sticky="ew")
-            si.columnconfigure(i, weight=1)
+            sb.grid(row=i//6, column=i%6, padx=4, pady=3, sticky="ew")
+            si.columnconfigure(i%6, weight=1)
             self._sb[lbl] = sb
 
         # Equipment / session info
@@ -469,9 +708,21 @@ class PHD2ViewerFrame(ctk.CTkFrame):
                                        text_color=FG_MUTED, anchor="w")
         self._info_lbl.pack(fill="x", padx=6, pady=(0,4))
 
-        # Graph area
-        self._graph_card = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10)
+        # Graph, complete details, and raw event views
+        detail_tabs = ctk.CTkTabview(self, fg_color=BG_CARD,
+                                     segmented_button_fg_color=BG_INPUT,
+                                     segmented_button_selected_color=ACCENT)
+        detail_tabs.pack(fill="both", expand=True)
+        detail_tabs.add("Graphs"); detail_tabs.add("Details"); detail_tabs.add("Events")
+        self._graph_card = ctk.CTkFrame(detail_tabs.tab("Graphs"), fg_color=BG_CARD,
+                                        corner_radius=10)
         self._graph_card.pack(fill="both", expand=True)
+        self._details_box = ctk.CTkTextbox(detail_tabs.tab("Details"), fg_color=BG_LOG,
+                                            text_color=FG_TEXT, font=("Consolas",11))
+        self._details_box.pack(fill="both", expand=True, padx=4, pady=4)
+        self._events_box = ctk.CTkTextbox(detail_tabs.tab("Events"), fg_color=BG_LOG,
+                                           text_color=FG_TEXT, font=("Consolas",10))
+        self._events_box.pack(fill="both", expand=True, padx=4, pady=4)
 
         if HAS_MPL:
             self._init_figure()
@@ -528,11 +779,70 @@ class PHD2ViewerFrame(ctk.CTkFrame):
             initialdir=str(Path.home()),
         )
         if p:
-            self._log_var.set(p)
+            label = f"Manual · {Path(p).name}"
+            self._library_paths[label] = Path(p)
+            self._log_var.set(label)
             self._load()
 
+    def refresh_library(self, auto_load=False):
+        cfg = load_config()
+        dest_value = cfg.get("dest", "").strip()
+        destination = Path(dest_value) if dest_value else None
+        paths = discover_phd2_logs(destination, include_debug=False) if destination and destination.is_dir() else []
+        self._library_paths = {
+            str(path.relative_to(destination)): path for path in paths
+        } if paths else {}
+        values = list(self._library_paths) or ["No archived guide logs found"]
+        self._log_combo.configure(values=values)
+        if self._log_var.get() not in self._library_paths:
+            self._log_var.set(values[0])
+        self._sync_lbl.configure(
+            text=f"{len(paths)} archived guide log(s) · {destination}" if paths else
+                 "No archived guide logs yet. Choose folders on Sort Files, then click Sync Logs.")
+        if auto_load and paths:
+            self._load()
+
+    def _initialise_library(self):
+        self.refresh_library(auto_load=True)
+        self._sync_logs(silent=True)
+
+    def _auto_sync_tick(self):
+        if self._auto_sync_var.get():
+            self._sync_logs(silent=True)
+        self.after(60000, self._auto_sync_tick)
+
+    def _sync_logs(self, silent=False):
+        if self._syncing: return
+        cfg = load_config()
+        source_value = cfg.get("source", "").strip()
+        dest_value = cfg.get("dest", "").strip()
+        source = Path(source_value) if source_value else None
+        destination = Path(dest_value) if dest_value else None
+        if not source or not destination or not source.is_dir() or not destination.is_dir():
+            if not silent:
+                messagebox.showerror("Folders required",
+                    "Choose the ASIAIR source and destination on the Sort Files tab first.")
+            return
+        self._syncing = True
+        self._sync_lbl.configure(text="Scanning and copying PHD2 logs…")
+        def work():
+            result = sync_phd2_logs(source, destination)
+            def done():
+                self._syncing = False
+                self.refresh_library(auto_load=True)
+                self._sync_lbl.configure(text=(
+                    f"Sync complete · {len(result['copied'])} new · "
+                    f"{len(result['updated'])} updated · {len(result['unchanged'])} unchanged · "
+                    f"{len(result['errors'])} errors"))
+                if result["errors"] and not silent:
+                    messagebox.showwarning("PHD2 sync completed with errors",
+                        "\n".join(f"{p}: {e}" for p,e in result["errors"][:8]))
+            self.after(0, done)
+        threading.Thread(target=work, daemon=True).start()
+
     def _load(self):
-        path = self._log_var.get().strip()
+        selected = self._log_var.get().strip()
+        path = self._library_paths.get(selected, Path(selected))
         if not path or not Path(path).is_file():
             messagebox.showerror("File not found", f"Cannot open:\n{path}")
             return
@@ -558,29 +868,103 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         rms_dec   = float(np.sqrt(np.mean(all_dec**2)))
         rms_total = float(np.sqrt(np.mean(all_ra**2 + all_dec**2)))
         peak      = float(np.max(np.sqrt(all_ra**2 + all_dec**2)))
+        p95       = float(np.percentile(np.sqrt(all_ra**2 + all_dec**2),95))
         total_dur = sum(s.duration_min for s in sessions)
         total_frm = sum(s.n_frames     for s in sessions)
+        total_dithers = sum(len(s.dithers) for s in sessions)
+        lost_frames = sum(s.lost_frames for s in sessions)
+        cadence = float(np.median([s.cadence_s for s in sessions if s.cadence_s])) if sessions else 0
+        all_snr = np.concatenate([s.snr for s in sessions if len(s.snr)]) if any(len(s.snr) for s in sessions) else np.array([])
+        all_hfd = np.concatenate([s.hfd for s in sessions if len(s.hfd)]) if any(len(s.hfd) for s in sessions) else np.array([])
+        avg_snr = float(np.nanmean(all_snr)) if len(all_snr) and not np.all(np.isnan(all_snr)) else None
+        avg_hfd = float(np.nanmean(all_hfd)) if len(all_hfd) and not np.all(np.isnan(all_hfd)) else None
         u  = '"' if sessions[0].units == "arcsec" else " px"
         rc = _rms_colour if sessions[0].units == "arcsec" else (lambda _: FG_TEXT)
 
         self._sb["RA RMS"].set(   f"{rms_ra:.2f}{u}",    rc(rms_ra))
         self._sb["Dec RMS"].set(  f"{rms_dec:.2f}{u}",   rc(rms_dec))
         self._sb["Total RMS"].set(f"{rms_total:.2f}{u}", rc(rms_total))
+        self._sb["P95 Error"].set(f"{p95:.2f}{u}", FG_TEXT)
         self._sb["Peak Error"].set(f"{peak:.2f}{u}",     FG_TEXT)
         self._sb["Duration"].set( f"{total_dur:.1f} min",FG_TEXT)
         self._sb["Frames"].set(   f"{total_frm:,}",      FG_TEXT)
+        self._sb["Cadence"].set(  f"{cadence:.2f} s" if cadence else "—", FG_TEXT)
+        self._sb["Dithers"].set(  f"{total_dithers}", FG_TEXT)
+        self._sb["Lost Frames"].set(f"{lost_frames}", "#ff7b72" if lost_frames else "#56d364")
+        self._sb["Avg SNR"].set(  f"{avg_snr:.1f}" if avg_snr is not None else "—", FG_TEXT)
+        self._sb["Avg HFD"].set(  f"{avg_hfd:.2f} px" if avg_hfd is not None else "—", FG_TEXT)
 
         # Equipment info line
         s0 = sessions[0]
         parts = []
         if s0.start_time: parts.append(s0.start_time)
+        if s0.profile:    parts.append(s0.profile)
         if s0.camera:     parts.append(s0.camera)
         if s0.mount:      parts.append(s0.mount)
         if s0.focal_mm:   parts.append(f"{s0.focal_mm:.0f} mm")
         if s0.px_scale:   parts.append(f"{s0.px_scale:.2f}\"/px")
+        if s0.exposure_s: parts.append(f"{s0.exposure_s:g} s guide exposure")
         if len(sessions) > 1:
             parts.append(f"{len(sessions)} guiding sessions in log")
         self._info_lbl.configure(text="  ·  ".join(parts))
+        self._update_details(sessions)
+
+    def _update_details(self, sessions: List[PHD2Session]):
+        lines = []
+        event_lines = []
+        for index, s in enumerate(sessions, 1):
+            unit = 'arcsec' if s.units == "arcsec" else "px"
+            errors = Counter(int(code) for code in s.error_codes if int(code))
+            ra_corr = int(np.count_nonzero(s.ra_pulse)) if len(s.ra_pulse) else 0
+            dec_corr = int(np.count_nonzero(s.dec_pulse)) if len(s.dec_pulse) else 0
+            lines.extend([
+                f"GUIDING SESSION {index}", "="*72,
+                f"Start / end       : {s.start_time or 'Unknown'}  →  {s.end_time or 'Unknown'}",
+                f"Duration / frames : {s.duration_min:.2f} min / {s.n_frames:,}",
+                f"PHD2              : {s.phd_version or 'Not recorded'}",
+                f"Profile           : {s.profile or 'Not recorded'}",
+                f"Camera            : {s.camera or 'Not recorded'}",
+                f"Mount / aux mount : {s.mount or 'Not recorded'} / {s.aux_mount or 'None'}",
+                f"Focal / scale     : {s.focal_mm or 0:g} mm / {s.px_scale or 0:g} arcsec/px",
+                f"Guide exposure    : {s.exposure_s:g} s" if s.exposure_s else "Guide exposure    : Not recorded",
+                f"Sky position      : {s.sky_position or 'Not recorded'}",
+                f"Lock position     : {s.lock_position or 'Not recorded'}", "",
+                f"RA RMS            : {s.rms_ra:.3f} {unit}",
+                f"Dec RMS           : {s.rms_dec:.3f} {unit}",
+                f"Total RMS         : {s.rms_total:.3f} {unit}",
+                f"Median / P95      : {s.median_err:.3f} / {s.p95_err:.3f} {unit}",
+                f"Peak error        : {s.peak_err:.3f} {unit}",
+                f"RA / Dec drift    : {s.drift_per_min('ra'):+.4f} / {s.drift_per_min('dec'):+.4f} {unit}/min",
+                f"Median cadence    : {s.cadence_s:.3f} s",
+                f"RA / Dec pulses   : {ra_corr:,} / {dec_corr:,}",
+                f"RA pulse avg/max  : {np.mean(s.ra_pulse):.1f} / {np.max(s.ra_pulse):.0f} ms" if len(s.ra_pulse) else "RA pulse avg/max  : —",
+                f"Dec pulse avg/max : {np.mean(s.dec_pulse):.1f} / {np.max(s.dec_pulse):.0f} ms" if len(s.dec_pulse) else "Dec pulse avg/max : —",
+                f"Dithers / errors  : {len(s.dithers)} / {s.lost_frames}",
+            ])
+            if errors:
+                lines.append("Guide-star errors : " + ", ".join(
+                    f"{PHD2_ERROR_LABELS.get(code, 'Code '+str(code))} ×{count}"
+                    for code,count in sorted(errors.items())))
+            for label, values, suffix in (("SNR",s.snr,""),("Star mass",s.star_mass,""),("HFD",s.hfd," px")):
+                finite = values[np.isfinite(values)] if len(values) else []
+                if len(finite):
+                    lines.append(f"{label:<18}: avg {np.mean(finite):.2f} · min {np.min(finite):.2f} · max {np.max(finite):.2f}{suffix}")
+            if s.algorithms:
+                lines.extend(["", "GUIDING SETTINGS"])
+                lines.extend(f"  {key}: {value}" for key,value in sorted(s.algorithms.items()))
+            lines.append("")
+            event_lines.append(f"SESSION {index} · {s.start_time or 'Unknown start'}")
+            event_lines.extend(s.events or ["No event messages recorded."])
+            event_lines.append("")
+
+        self._details_box.configure(state="normal")
+        self._details_box.delete("1.0","end")
+        self._details_box.insert("end","\n".join(lines))
+        self._details_box.configure(state="disabled")
+        self._events_box.configure(state="normal")
+        self._events_box.delete("1.0","end")
+        self._events_box.insert("end","\n".join(event_lines))
+        self._events_box.configure(state="disabled")
 
     # ── Graphs ─────────────────────────────────────────────────────────────
 
@@ -721,8 +1105,9 @@ class FolderCard(ctk.CTkFrame):
 
 
 class SortFrame(ctk.CTkFrame):
-    def __init__(self, parent):
+    def __init__(self, parent, on_complete=None):
         super().__init__(parent, fg_color="transparent")
+        self._on_complete = on_complete
         cfg = load_config()
         self.src_var  = tk.StringVar(value=cfg.get("source",""))
         self.dst_var  = tk.StringVar(value=cfg.get("dest",""))
@@ -873,7 +1258,10 @@ class SortFrame(ctk.CTkFrame):
     def _worker(self, src, dst, mode, dry_run):
         try: self._sort(src, dst, mode, dry_run)
         except Exception as e: self._log(f"\nFATAL ERROR: {e}","err")
-        finally: self._running = False; self._set_busy(False)
+        finally:
+            self._running = False; self._set_busy(False)
+            if self._on_complete and not dry_run:
+                self.after(0, self._on_complete)
 
     def _sort(self, src, dst, mode, dry_run):
         label  = "[DRY RUN]  " if dry_run else ""
@@ -924,7 +1312,7 @@ class SortFrame(ctk.CTkFrame):
             self._log(f"  {info['frame_type']:<8}  {ftag:<8}  {fp.name}", colour)
             self._log(f"             → {rel}","mono_dim")
 
-            sk = (info["date"], info.get("target") or "")
+            sk = (info["date"], info.get("camera") or "", info.get("target") or "")
             session_log.setdefault(sk,[]).append((info,str(fp),str(dest_fp)))
 
             success = True
@@ -940,12 +1328,14 @@ class SortFrame(ctk.CTkFrame):
 
         if not dry_run and session_log:
             self._log("\n  Writing session summaries…","info")
-            for (date, target), entries in session_log.items():
+            for (date, camera, target), entries in session_log.items():
                 sdir = dst/SESSIONS_ROOT/date
+                if camera: sdir = sdir/camera
                 if target: sdir = sdir/target
                 try:
                     sdir.mkdir(parents=True, exist_ok=True)
-                    write_session_summary(sdir, date, target or None, entries, action)
+                    write_session_summary(sdir, date, target or None,
+                                          camera or None, entries, action)
                     try: disp = sdir.relative_to(dst)
                     except ValueError: disp = sdir
                     self._log(f"  ✓  session_summary.txt  →  {disp}","ok")
@@ -1015,8 +1405,11 @@ class App(ctk.CTk):
         tabs.add("Sort Files")
         tabs.add("PHD2 Viewer")
 
-        SortFrame(tabs.tab("Sort Files")).pack(fill="both", expand=True)
-        PHD2ViewerFrame(tabs.tab("PHD2 Viewer")).pack(fill="both", expand=True)
+        viewer = PHD2ViewerFrame(tabs.tab("PHD2 Viewer"))
+        SortFrame(tabs.tab("Sort Files"),
+                  on_complete=lambda: viewer.refresh_library(auto_load=True)).pack(
+                      fill="both", expand=True)
+        viewer.pack(fill="both", expand=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -3,14 +3,18 @@
 ; ============================================================
 
 #define AppName      "ASIAIR Session Sorter"
-#define AppVersion   "2.2"
+#define AppVersion   "2.3"
 #define AppPublisher "pulikantitarun"
 #define AppExeName   "ASIAIR_Sorter.exe"
 
 ; Paths relative to this .iss file (works locally and in CI)
+#ifndef SourceExe
 #define SourceExe    "..\dist\ASIAIR_Sorter.exe"
+#endif
 #define AppIcon      "..\asiair_sorter.ico"
+#ifndef OutputDir
 #define OutputDir    "..\installer_output"
+#endif
 
 [Setup]
 AppId={{8F3A2C1B-4D6E-4F7A-9B2C-1E5D8F3A2C1B}
@@ -47,6 +51,10 @@ PrivilegesRequiredOverridesAllowed=dialog
 
 ; Uninstall
 UninstallDisplayName={#AppName}
+UsePreviousAppDir=yes
+CloseApplications=yes
+RestartApplications=no
+Uninstallable=yes
 
 ; Misc
 ShowLanguageDialog=no
