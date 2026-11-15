@@ -1,6 +1,7 @@
 # ASIAIR Session Sorter
 
-A Windows desktop app that organises your **ZWO ASIAIR** SD card data into a clean, date-and-target folder structure — with a built-in **PHD2 guiding log viewer** showing RA/Dec error graphs and session statistics.
+A cross-platform desktop app that organises **ZWO ASIAIR** data, catalogues
+PixInsight masters, tracks storage and imaging progress, and analyses PHD2 logs.
 
 ![ASIAIR Session Sorter](https://raw.githubusercontent.com/pulikantitarun/asiair-sorter/main/docs/screenshot.png)
 
@@ -10,6 +11,15 @@ A Windows desktop app that organises your **ZWO ASIAIR** SD card data into a cle
 
 - **One-click sorting** — picks up the Asiair's own folder structure (Light/Dark/Flat/Bias, filter subfolders, target names) so nothing gets misclassified
 - **Target folders from filenames** — reads `Light_<target>_<exposure>s_Bin...` names so mixed-target source folders are separated correctly
+- **FITS header metadata** — reads target, camera, filter, exposure, gain, temperature, binning, date and frame type without loading image pixels
+- **PixInsight master-light catalogue** — indexes `.xisf` masters, integration information and SHA-256 verification
+- **Session library and search** — browse by date, camera, target, filter and path from a local SQLite catalogue
+- **Target goals** — compare collected integration time with per-target/per-filter goals
+- **Storage dashboard** — register mounted PC, NAS, Google Drive and OneCloud folders and see online/free-space status
+- **Duplicate detection** — content-based SHA-256 duplicate groups and reclaimable-space estimates
+- **Approval-only cleanup** — raw lights are eligible only with a verified XISF master and byte-identical backup; one raw copy is always preserved
+- **Audit and undo** — copy/move operations are logged; unchanged copies and moves can be undone safely
+- **ASIAIR watcher** — detects new files on the selected source and updates the catalogue without moving or deleting them
 - **JPG preview cleanup** — deletes Asiair's preview JPEGs from the SD card without copying them to your archive
 - **PHD2 log viewer** — load any PHD2 guide log and see interactive RA/Dec error graphs, star SNR, dither markers, and per-session RMS/peak-error stats
 - **Automatic PHD2 log library** — copies new or changed guide/debug logs from the remembered ASIAIR source, refreshes every 60 seconds, and opens the newest guide log automatically
@@ -43,10 +53,10 @@ A Windows desktop app that organises your **ZWO ASIAIR** SD card data into a cle
 Pre-built downloads are available for Windows, macOS and Linux from the
 [latest release](https://github.com/pulikantitarun/asiair-sorter/releases/latest).
 
-- **Windows:** use `ASIAIR_Sorter_Setup_v2.3.exe`. It replaces an older
+- **Windows:** use `ASIAIR_Sorter_Setup_v3.0.exe`. It replaces an older
   installation in place while retaining saved source/destination settings.
-- **macOS:** unzip `ASIAIR_Sorter_macOS_v2.3.zip`, then open the app bundle.
-- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v2.3.tar.gz`, make the binary
+- **macOS:** unzip `ASIAIR_Sorter_macOS_v3.0.zip`, then open the app bundle.
+- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v3.0.tar.gz`, make the binary
   executable if required, and run `ASIAIR_Sorter`.
 
 ### Pre-built Windows installer (recommended)
@@ -82,7 +92,12 @@ To rebuild the Windows installer, open `installer/asiair_sorter_setup.iss` in [I
 2. Click **Browse…** next to *Main Storage Folder* and select your archive destination
 3. Optionally tick **Dry Run** to preview without touching files
 4. Click **Copy Files** or **Move Files**
-5. Switch to the **PHD2 Viewer** tab to load and graph any PHD2 log file
+5. Open **Library**, click **Scan Destination**, and optionally register mounted NAS/cloud folders
+6. Switch to **PHD2 Viewer** to sync, score and inspect guiding logs
+
+The catalogue stays on the PC in `~/.asiair_sorter/catalog.sqlite3`. Google
+Drive, OneCloud and NAS storage should be mounted or synced as normal folders;
+the app never needs cloud account passwords.
 
 ---
 
@@ -118,7 +133,8 @@ Contributions are very welcome! Ideas for future features:
 2. Make your changes, test against a real Asiair SD card dump if possible
 3. Open a pull request with a clear description of what you changed and why
 
-Please keep the single-file design (`asiair_sorter.py`) for ease of distribution, unless a change genuinely requires splitting.
+Keep the interface in `asiair_sorter.py` and catalogue/safety logic in
+`astro_catalog.py` so both remain testable and easy to package.
 
 ---
 

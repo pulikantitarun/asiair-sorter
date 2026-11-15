@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         ASIAIR Astrophotography Session Sorter  v2.3         ║
+║         ASIAIR Astrophotography Session Sorter  v3.0         ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage (from source):
@@ -57,8 +57,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from typing import List, Optional
+
+from astro_catalog import (
+    Catalog, SourceWatcher, merged_metadata, phd2_quality_score, sha256_file,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS — edit here to customise output folder names
@@ -88,7 +92,7 @@ _LIGHT_CAMERA_RE = re.compile(
     re.IGNORECASE,
 )
 _INVALID_FOLDER_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
-VERSION     = "2.3"
+VERSION     = "3.0"
 
 # ── UI palette ────────────────────────────────────────────────────────────────
 BG_APP     = "#0d1117"
@@ -154,6 +158,9 @@ def _find_date(parts: list, filename: str) -> str:
 
 def _safe_folder_name(value: str):
     """Return a Windows-safe target folder name without changing its identity."""
+    if value is None:
+        return None
+    value = str(value)
     value = _INVALID_FOLDER_CHARS_RE.sub("_", value)
     value = re.sub(r"\s+", " ", value).strip(" .")
     if not value:
@@ -212,7 +219,8 @@ def _find_filter(parts: list):
             if p.lower() == f.lower(): return f
     return None
 
-def classify_file(fp: Path, src_root: Path):
+def classify_file(fp: Path, src_root: Path, metadata=None):
+    metadata = metadata or {}
     parts    = _rel_parts(fp, src_root)
     filename = fp.name
     ext      = fp.suffix.lower()
@@ -227,13 +235,19 @@ def classify_file(fp: Path, src_root: Path):
                     "date":_find_date(parts,filename),"target":None,"filter_name":None}
         return None
     if ext in IMAGING_EXTENSIONS:
-        ft = _find_frame_type(parts)
+        embedded_type = str(metadata.get("frame_type") or "").lower()
+        ft = next((name for name in ("Light", "Dark", "Flat", "Bias")
+                   if name.lower() in embedded_type), _find_frame_type(parts))
         camera, filename_filter = _find_camera_and_filter_from_filename(filename) if ft=="Light" else (None,None)
         return {"action":"copy_fits","frame_type":ft,
-                "date":_find_date(parts,filename),
-                "target":_find_target(parts, filename) if ft=="Light" else None,
-                "camera":camera,
-                "filter_name":filename_filter or (_find_filter(parts) if ft=="Light" else None)}
+                "date":metadata.get("capture_date") or _find_date(parts,filename),
+                "target":(_safe_folder_name(metadata.get("target")) or
+                          _find_target(parts, filename)) if ft=="Light" else None,
+                "camera":_safe_folder_name(metadata.get("camera")) or camera,
+                "filter_name":(_safe_folder_name(metadata.get("filter")) or filename_filter or
+                               (_find_filter(parts) if ft=="Light" else None)),
+                "exposure":metadata.get("exposure"), "gain":metadata.get("gain"),
+                "temperature":metadata.get("temperature"), "binning":metadata.get("binning")}
     return None
 
 def build_dest_path(info: dict, dst_root: Path, filename: str) -> Path:
@@ -634,8 +648,9 @@ class StatBox(ctk.CTkFrame):
 
 
 class PHD2ViewerFrame(ctk.CTkFrame):
-    def __init__(self, parent):
+    def __init__(self, parent, catalog=None):
         super().__init__(parent, fg_color="transparent")
+        self.catalog = catalog or Catalog()
         self._sessions: List[PHD2Session] = []
         self._library_paths = {}
         self._syncing = False
@@ -694,12 +709,12 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         si.pack(fill="x", padx=16, pady=10)
 
         self._sb = {}
-        labels = ["RA RMS","Dec RMS","Total RMS","P95 Error","Peak Error","Duration",
+        labels = ["Quality","RA RMS","Dec RMS","Total RMS","P95 Error","Peak Error","Duration",
                   "Frames","Cadence","Dithers","Lost Frames","Avg SNR","Avg HFD"]
         for i, lbl in enumerate(labels):
             sb = StatBox(si, lbl)
-            sb.grid(row=i//6, column=i%6, padx=4, pady=3, sticky="ew")
-            si.columnconfigure(i%6, weight=1)
+            sb.grid(row=i//7, column=i%7, padx=4, pady=3, sticky="ew")
+            si.columnconfigure(i%7, weight=1)
             self._sb[lbl] = sb
 
         # Equipment / session info
@@ -855,7 +870,13 @@ class PHD2ViewerFrame(ctk.CTkFrame):
             messagebox.showwarning("No data", "No guiding data found in this file.")
             return
         self._sessions = sessions
+        scores = [self.catalog.record_phd2_quality(Path(path), session, session_index=index)
+                  for index, session in enumerate(sessions, 1)]
         self._update_stats(sessions)
+        if scores:
+            score = sum(scores) / len(scores)
+            colour = "#56d364" if score >= 80 else "#e3b341" if score >= 60 else "#ff7b72"
+            self._sb["Quality"].set(f"{score:.0f}/100", colour)
         if HAS_MPL:
             self._draw_graphs(sessions)
 
@@ -934,6 +955,7 @@ class PHD2ViewerFrame(ctk.CTkFrame):
                 f"Total RMS         : {s.rms_total:.3f} {unit}",
                 f"Median / P95      : {s.median_err:.3f} / {s.p95_err:.3f} {unit}",
                 f"Peak error        : {s.peak_err:.3f} {unit}",
+                f"Quality score     : {phd2_quality_score(s.rms_total, s.peak_err, s.lost_frames, s.n_frames, s.drift_per_min('ra'), s.drift_per_min('dec')):.1f} / 100",
                 f"RA / Dec drift    : {s.drift_per_min('ra'):+.4f} / {s.drift_per_min('dec'):+.4f} {unit}/min",
                 f"Median cadence    : {s.cadence_s:.3f} s",
                 f"RA / Dec pulses   : {ra_corr:,} / {dec_corr:,}",
@@ -1105,9 +1127,10 @@ class FolderCard(ctk.CTkFrame):
 
 
 class SortFrame(ctk.CTkFrame):
-    def __init__(self, parent, on_complete=None):
+    def __init__(self, parent, on_complete=None, catalog=None):
         super().__init__(parent, fg_color="transparent")
         self._on_complete = on_complete
+        self.catalog = catalog or Catalog()
         cfg = load_config()
         self.src_var  = tk.StringVar(value=cfg.get("source",""))
         self.dst_var  = tk.StringVar(value=cfg.get("dest",""))
@@ -1292,14 +1315,18 @@ class SortFrame(ctk.CTkFrame):
             if not self._running: cancelled = True; break
             self._set_progress((i/total)*100)
             self._set_status(f"{i+1}/{total}  ·  {fp.name}")
-            info = classify_file(fp, src)
+            metadata = merged_metadata(fp) if fp.suffix.lower() in IMAGING_EXTENSIONS else {}
+            info = classify_file(fp, src, metadata)
             if info is None:
                 self._log(f"  SKIP      {fp.name}","skip"); counts["skip"]+=1; continue
 
             if info["action"] == "delete_preview":
                 self._log(f"  DELETE    {fp.name}  (preview — removed from SD)","del")
                 if not dry_run:
-                    try: fp.unlink(); counts["deleted"]+=1
+                    try:
+                        fp.unlink(); counts["deleted"]+=1
+                        self.catalog.record_audit("delete_preview", fp, status="complete",
+                                                  undoable=False, details="ASIAIR preview removed")
                     except OSError as e: self._log(f"    ✗  {e}","err"); counts["err"]+=1
                 else: counts["deleted"]+=1
                 continue
@@ -1320,6 +1347,10 @@ class SortFrame(ctk.CTkFrame):
                 try:
                     dest_fp.parent.mkdir(parents=True, exist_ok=True)
                     (shutil.move if mode=="move" else shutil.copy2)(str(fp),str(dest_fp))
+                    checksum = sha256_file(dest_fp) if mode == "copy" else None
+                    self.catalog.record_audit(mode, fp, dest_fp, checksum,
+                                              undoable=True,
+                                              details=json.dumps({"frame_type": info["frame_type"]}))
                 except OSError as e:
                     self._log(f"    ✗  {e}","err"); counts["err"]+=1; success=False
 
@@ -1363,6 +1394,217 @@ class SortFrame(ctk.CTkFrame):
 # Main Application
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _human_bytes(value):
+    value = float(value or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB": return f"{value:.1f} {unit}"
+        value /= 1024
+
+
+class LibraryFrame(ctk.CTkFrame):
+    """Searchable local catalogue; cloud/NAS locations remain ordinary folders."""
+    def __init__(self, parent, catalog):
+        super().__init__(parent, fg_color="transparent")
+        self.catalog = catalog
+        self._watcher = None
+        self._watch_var = tk.BooleanVar(value=False)
+        self._status_var = tk.StringVar(value="Catalogue ready")
+        self._search_var = tk.StringVar()
+        self._build_ui()
+        self.after(150, self.refresh)
+
+    def _build_ui(self):
+        bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10)
+        bar.pack(fill="x", pady=(0,8))
+        ctk.CTkLabel(bar, text="Astrophotography Library",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=14, pady=10)
+        ctk.CTkLabel(bar, textvariable=self._status_var, text_color=FG_MUTED,
+                     font=ctk.CTkFont(size=10)).pack(side="left", padx=8)
+        ctk.CTkButton(bar, text="Scan Folder…", width=100, command=self._choose_scan).pack(side="right", padx=(4,12), pady=8)
+        ctk.CTkButton(bar, text="Scan Destination", width=120,
+                      command=self.scan_configured).pack(side="right", padx=4, pady=8)
+        ctk.CTkButton(bar, text="Refresh", width=70, command=self.refresh).pack(side="right", padx=4, pady=8)
+        ctk.CTkCheckBox(bar, text="Watch ASIAIR", variable=self._watch_var,
+                        command=self._toggle_watcher, text_color=FG_MUTED,
+                        border_color=BORDER).pack(side="right", padx=10)
+
+        self.tabs = ctk.CTkTabview(self, fg_color=BG_CARD,
+                                   segmented_button_fg_color=BG_INPUT,
+                                   segmented_button_selected_color=ACCENT)
+        self.tabs.pack(fill="both", expand=True)
+        self._boxes = {}
+        for name in ("Overview", "Sessions", "Masters", "Targets", "Search",
+                     "Cleanup", "Duplicates", "Storage", "Audit"):
+            self.tabs.add(name)
+            tab = self.tabs.tab(name)
+            controls = ctk.CTkFrame(tab, fg_color="transparent")
+            controls.pack(fill="x", padx=4, pady=(4,0))
+            if name == "Targets":
+                ctk.CTkButton(controls, text="Set Integration Goal…", width=150,
+                              command=self._set_goal).pack(side="left")
+            elif name == "Search":
+                ctk.CTkEntry(controls, textvariable=self._search_var,
+                             placeholder_text="Target, camera, filter, date or path",
+                             fg_color=BG_INPUT, border_color=BORDER).pack(side="left", fill="x", expand=True, padx=(0,6))
+                ctk.CTkButton(controls, text="Search", width=70,
+                              command=self._run_search).pack(side="left")
+            elif name == "Cleanup":
+                ctk.CTkButton(controls, text="Review and Delete Eligible Raw Lights…", width=245,
+                              fg_color=BTN_CANCEL, hover_color="#8b3a3a",
+                              command=self._cleanup).pack(side="left")
+                ctk.CTkLabel(controls, text="Requires verified XISF master + byte-identical backup; keeps one raw copy.",
+                             text_color=FG_MUTED, font=ctk.CTkFont(size=10)).pack(side="left", padx=10)
+            elif name == "Storage":
+                ctk.CTkButton(controls, text="Add PC / NAS / Cloud Folder…", width=190,
+                              command=self._add_storage).pack(side="left")
+            elif name == "Audit":
+                ctk.CTkButton(controls, text="Undo Operation…", width=130,
+                              command=self._undo).pack(side="left")
+            else:
+                ctk.CTkLabel(controls, text=" ").pack(side="left")
+            box = ctk.CTkTextbox(tab, fg_color=BG_LOG, text_color=FG_TEXT,
+                                 font=("Consolas", 10), wrap="none")
+            box.pack(fill="both", expand=True, padx=4, pady=4)
+            self._boxes[name] = box
+
+    def _write(self, name, text):
+        box = self._boxes[name]
+        box.configure(state="normal"); box.delete("1.0", "end")
+        box.insert("end", text or "No records yet."); box.configure(state="disabled")
+
+    def refresh(self):
+        d = self.catalog.dashboard()
+        roots = self.catalog.storage_roots()
+        quality = self.catalog.phd2_quality_rows()
+        overview = [
+            "LIBRARY OVERVIEW", "="*72,
+            f"Indexed files       {d['files']:,}", f"Indexed size        {_human_bytes(d['bytes'])}",
+            f"Sessions            {d['sessions']:,}", f"Targets             {d['targets'] or 0}",
+            f"Verified masters    {d['masters'] or 0}",
+            f"Duplicate groups    {d['duplicate_groups']:,}  ({_human_bytes(d['duplicate_bytes'])} reclaimable)",
+            f"Safe cleanup queue  {d['cleanup_files']:,}  ({_human_bytes(d['cleanup_bytes'])})",
+            f"Storage locations   {len(roots)}", f"PHD2 scores         {len(quality)}",
+        ]
+        if quality:
+            overview += ["", "RECENT GUIDING QUALITY"] + [
+                f"{r.get('capture_date') or 'Unknown':<12} {r['score']:>5.1f}/100  RMS {r['rms_total']:.3f}  {Path(r['path']).name}"
+                for r in quality[:10]]
+        self._write("Overview", "\n".join(overview))
+
+        self._write("Sessions", "\n".join(
+            f"{r['capture_date'] or 'Unknown':<12}  {(r['camera'] or 'Unknown'):<18}  {(r['target'] or 'Unknown'):<24} "
+            f"{r['files']:>5} files  {r['integration_seconds']/3600:>7.2f} h  {_human_bytes(r['bytes'])}"
+            for r in self.catalog.sessions()))
+        self._write("Masters", "\n\n".join(
+            f"{'VERIFIED' if r['verified'] else 'UNVERIFIED'}  {r['target'] or 'Unknown'} / {r['filter_name'] or 'No filter'}\n"
+            f"  {r['sub_count'] or '?'} subs · {(r['integration_seconds'] or 0)/3600:.2f} h · SHA256 {(r['checksum'] or 'none')[:16]}…\n  {r['path']}"
+            for r in self.catalog.masters()))
+        self._write("Targets", "\n".join(
+            f"{(r['target'] or 'Unknown'):<28} {(r['filter_name'] or 'All'):<8}  "
+            f"{r['collected_seconds']/3600:>7.2f} h / {r['goal_seconds']/3600:>7.2f} h  "
+            f"{(100*r['collected_seconds']/r['goal_seconds'] if r['goal_seconds'] else 0):>6.1f}%  {r['frames']} frames"
+            for r in self.catalog.target_progress()))
+        candidates = self.catalog.cleanup_candidates()
+        self._write("Cleanup", "\n\n".join(
+            f"{_human_bytes(r['size']):>10}  {r['target'] or 'Unknown'} / {r['filter_name'] or 'No filter'}\n"
+            f"  RAW    {r['path']}\n  MASTER {r['master_path']}"
+            for r in candidates))
+        self._write("Duplicates", "\n\n".join(
+            f"{r['copies']} copies · {_human_bytes(r['size'])} each · SHA256 {r['sha256'][:16]}…\n{r['paths']}"
+            for r in self.catalog.duplicate_groups()))
+        self._write("Storage", "\n\n".join(
+            f"{'ONLINE ' if r['online'] else 'OFFLINE'}  {r['label']} [{r['role']}]\n"
+            f"  Free {_human_bytes(r.get('free_bytes'))} / {_human_bytes(r.get('total_bytes'))}\n  {r['path']}"
+            for r in roots))
+        self._write("Audit", "\n".join(
+            f"#{r['id']:<5} {r['timestamp']}  {r['operation']:<15} {r['status']:<9} "
+            f"{'UNDO' if r['undoable'] and not r['undone'] else '':<5}  {r['src'] or ''}  →  {r['dst'] or ''}"
+            for r in self.catalog.audit_rows()))
+        self._run_search()
+
+    def _run_search(self):
+        rows = self.catalog.search_files(self._search_var.get())
+        self._write("Search", "\n".join(
+            f"{r['capture_date'] or 'Unknown':<12} {(r['frame_type'] or r['kind'] or ''):<9} "
+            f"{(r['target'] or ''):<24} {(r['filter_name'] or ''):<7} {_human_bytes(r['size']):>10}  {r['path']}"
+            for r in rows))
+
+    def _choose_scan(self):
+        path = filedialog.askdirectory(title="Choose astronomy folder to catalogue")
+        if path: self._scan(Path(path), Path(path).name, "archive")
+
+    def scan_configured(self):
+        value = load_config().get("dest", "").strip()
+        if not value or not Path(value).is_dir():
+            messagebox.showerror("Destination required", "Choose a valid destination on Sort Files first.")
+            return
+        self._scan(Path(value), "Primary archive", "archive")
+
+    def _scan(self, path, label, role):
+        self._status_var.set(f"Scanning {path}…")
+        def work():
+            try:
+                result = self.catalog.scan(path, label, role,
+                    progress=lambda i,n,p: self.after(0, lambda i=i,n=n: self._status_var.set(f"Indexing {i}/{n}…")))
+                text = (f"Scan complete · {result.indexed} new · {result.updated} updated · "
+                        f"{result.unchanged} unchanged · {result.masters} masters · {result.errors} errors")
+            except Exception as exc: text = f"Scan failed: {exc}"
+            self.after(0, lambda: (self._status_var.set(text), self.refresh()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_goal(self):
+        target = simpledialog.askstring("Target goal", "Target name:", parent=self)
+        if not target: return
+        filt = simpledialog.askstring("Target goal", "Filter (leave blank for none):", parent=self) or ""
+        hours = simpledialog.askfloat("Target goal", "Integration goal in hours:", minvalue=0, parent=self)
+        if hours is not None: self.catalog.set_target_goal(target, filt, hours); self.refresh()
+
+    def _cleanup(self):
+        rows = self.catalog.cleanup_candidates()
+        if not rows:
+            messagebox.showinfo("Nothing eligible", "No raw light has both a verified master and a byte-identical backup.")
+            return
+        size = sum(r["size"] for r in rows)
+        if not messagebox.askyesno("Review raw-light cleanup",
+            f"{len(rows)} raw lights use {_human_bytes(size)}.\n\nThe app will keep at least one raw copy per checksum group. Continue?"):
+            return
+        word = simpledialog.askstring("Final confirmation", "Type DELETE to remove eligible copies:", parent=self)
+        try: result = self.catalog.delete_raws([Path(r["path"]) for r in rows], word or "")
+        except PermissionError as exc: messagebox.showerror("Cleanup cancelled", str(exc)); return
+        messagebox.showinfo("Cleanup complete", f"Deleted {len(result['deleted'])}; preserved/refused {len(result['refused'])}; errors {len(result['errors'])}.")
+        self.refresh()
+
+    def _add_storage(self):
+        path = filedialog.askdirectory(title="Choose mounted PC, NAS, Google Drive or OneCloud folder")
+        if not path: return
+        label = simpledialog.askstring("Storage label", "Name this location:", initialvalue=Path(path).name, parent=self)
+        role = simpledialog.askstring("Storage role", "Role (archive, backup, cloud, sd-card):", initialvalue="backup", parent=self)
+        if label: self.catalog.add_storage_root(Path(path), label, role or "backup"); self.refresh()
+
+    def _undo(self):
+        audit_id = simpledialog.askinteger("Undo operation", "Audit operation ID to undo:", minvalue=1, parent=self)
+        if audit_id is None: return
+        if self.catalog.undo(audit_id): messagebox.showinfo("Undo complete", f"Operation #{audit_id} was undone.")
+        else: messagebox.showerror("Cannot undo", "The operation is not undoable, was already undone, or its file changed.")
+        self.refresh()
+
+    def _toggle_watcher(self):
+        if self._watcher: self._watcher.stop(); self._watcher = None
+        if not self._watch_var.get(): self._status_var.set("ASIAIR watcher stopped"); return
+        value = load_config().get("source", "").strip()
+        if not value or not Path(value).is_dir():
+            self._watch_var.set(False); messagebox.showerror("Source required", "Choose a valid ASIAIR source first."); return
+        source = Path(value)
+        def changed(path):
+            self.after(0, lambda: self._status_var.set("New ASIAIR files detected; updating index…"))
+            try: self.catalog.scan(path, "ASIAIR SD card", "sd-card", hash_duplicates=False)
+            finally: self.after(0, self.refresh)
+        self._watcher = SourceWatcher(source, changed); self._watcher.start()
+        self._status_var.set(f"Watching {source}")
+
+    def shutdown(self):
+        if self._watcher: self._watcher.stop()
+
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -1370,12 +1612,13 @@ ctk.set_default_color_theme("blue")
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
+        self.catalog = Catalog()
         self.title("ASIAIR Session Sorter")
-        self.geometry("800x700")
-        self.minsize(700, 580)
+        self.geometry("1200x800")
+        self.minsize(1000, 650)
         self.configure(fg_color=BG_APP)
         self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_ui(self):
         # ── Header ────────────────────────────────────────────────────
@@ -1403,13 +1646,23 @@ class App(ctk.CTk):
                                text_color_disabled=FG_MUTED)
         tabs.pack(fill="both", expand=True, padx=14, pady=(8,12))
         tabs.add("Sort Files")
+        tabs.add("Library")
         tabs.add("PHD2 Viewer")
 
-        viewer = PHD2ViewerFrame(tabs.tab("PHD2 Viewer"))
+        self.library = LibraryFrame(tabs.tab("Library"), self.catalog)
+        self.library.pack(fill="both", expand=True)
+        viewer = PHD2ViewerFrame(tabs.tab("PHD2 Viewer"), self.catalog)
+        def sorted_complete():
+            viewer.refresh_library(auto_load=True)
+            self.library.scan_configured()
         SortFrame(tabs.tab("Sort Files"),
-                  on_complete=lambda: viewer.refresh_library(auto_load=True)).pack(
+                  on_complete=sorted_complete, catalog=self.catalog).pack(
                       fill="both", expand=True)
         viewer.pack(fill="both", expand=True)
+
+    def _close(self):
+        self.library.shutdown()
+        self.destroy()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

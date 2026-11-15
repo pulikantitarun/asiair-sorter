@@ -7,6 +7,18 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+dist-v3/
+build-v3/
+build-deps-v3/
+tcl-build/
+installer_output/
+python-build-runtime-v3/
+python-layout-v3/
+python-layout-v3-full/
+python-nuget-v3/
+python-nuget-*.zip
+python-tcltk-extract/
+installer-v3-test.log
 *.spec
 
 # PyInstaller output
