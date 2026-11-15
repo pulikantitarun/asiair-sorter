@@ -18,13 +18,19 @@ PixInsight masters, tracks storage and imaging progress, and analyses PHD2 logs.
 - **Storage dashboard** — register mounted PC, NAS, Google Drive and OneCloud folders and see online/free-space status
 - **Duplicate detection** — content-based SHA-256 duplicate groups and reclaimable-space estimates
 - **Approval-only cleanup** — raw lights are eligible only with a verified XISF master and byte-identical backup; one raw copy is always preserved
-- **Audit and undo** — copy/move operations are logged; unchanged copies and moves can be undone safely
+- **Audit and undo** — verified copies are logged and unchanged destination copies can be removed safely through Undo
+- **Image-quality ranking** — measures FWHM, eccentricity, star count, background, noise and SNR directly from FITS lights
+- **Problem detection** — flags likely clouds, star trailing, focus drift and poor frames before stacking
+- **Large-library controls** — incremental metadata indexing, pause/cancel, throttled background hashing, progress and ETA
+- **Detailed sessions** — thumbnails, notes, ratings, tags, aliases, combined PHD2/weather context, timelines and CSV/PDF reports
+- **Database maintenance** — verified SQLite backups, integrity checking and repair controls
+- **ASIAIR media automation** — detects mounted ASIAIR storage and can eject only after verified copying when explicitly enabled
 - **ASIAIR watcher** — detects new files on the selected source and updates the catalogue without moving or deleting them
 - **JPG preview cleanup** — deletes Asiair's preview JPEGs from the SD card without copying them to your archive
 - **PHD2 log viewer** — load any PHD2 guide log and see interactive RA/Dec error graphs, star SNR, dither markers, and per-session RMS/peak-error stats
 - **Automatic PHD2 log library** — copies new or changed guide/debug logs from the remembered ASIAIR source, refreshes every 60 seconds, and opens the newest guide log automatically
 - **Detailed guiding analysis** — equipment, algorithms, sky position, RMS/median/P95/peak error, drift, correction pulses, cadence, dithers, SNR, star mass, HFD, lost-star reasons, and session events
-- **Move or copy** — copy keeps the SD card intact; move clears it out
+- **Copy and verify only** — source and destination SHA-256 hashes must match; raw FITS files are never removed automatically
 - **Dry run** — preview every action before touching a single file
 - **Dark themed UI** — built with customtkinter
 - **Remembers** your last-used folders
@@ -53,10 +59,10 @@ PixInsight masters, tracks storage and imaging progress, and analyses PHD2 logs.
 Pre-built downloads are available for Windows, macOS and Linux from the
 [latest release](https://github.com/pulikantitarun/asiair-sorter/releases/latest).
 
-- **Windows:** use `ASIAIR_Sorter_Setup_v3.0.exe`. It replaces an older
+- **Windows:** use `ASIAIR_Sorter_Setup_v3.1.exe`. It replaces an older
   installation in place while retaining saved source/destination settings.
-- **macOS:** unzip `ASIAIR_Sorter_macOS_v3.0.zip`, then open the app bundle.
-- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v3.0.tar.gz`, make the binary
+- **macOS:** unzip `ASIAIR_Sorter_macOS_v3.1.zip`, then open the app bundle.
+- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v3.1.tar.gz`, make the binary
   executable if required, and run `ASIAIR_Sorter`.
 
 ### Pre-built Windows installer (recommended)
@@ -91,7 +97,7 @@ To rebuild the Windows installer, open `installer/asiair_sorter_setup.iss` in [I
 1. Click **Browse…** next to *SD Card / Asiair Folder* and select your SD card root (e.g. `E:\ASIAIR`)
 2. Click **Browse…** next to *Main Storage Folder* and select your archive destination
 3. Optionally tick **Dry Run** to preview without touching files
-4. Click **Copy Files** or **Move Files**
+4. Click **Preview Report** to inspect the plan, then **Copy + Verify**
 5. Open **Library**, click **Scan Destination**, and optionally register mounted NAS/cloud folders
 6. Switch to **PHD2 Viewer** to sync, score and inspect guiding logs
 

@@ -9,6 +9,7 @@ XISF files; image pixel data is never loaded.
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
 import os
 import re
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+from image_quality import QualityBatch, QualityResult, analyse_fits
 
 
 CATALOG_EXTENSIONS = frozenset({".fit", ".fits", ".fts", ".xisf", ".log", ".txt"})
@@ -249,6 +252,24 @@ def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def sha256_file_limited(path: Path, rate_mbps: float = 0.0, controller=None,
+                        chunk_size: int = 4 * 1024 * 1024) -> str:
+    """Hash a file with an optional read-rate ceiling for responsive NAS use."""
+    digest = hashlib.sha256(); started = time.monotonic(); total = 0
+    bytes_per_second = max(0.0, float(rate_mbps)) * 1024 * 1024
+    with Path(path).open("rb") as fh:
+        while True:
+            if controller is not None and not controller.checkpoint():
+                raise InterruptedError("Hashing cancelled")
+            chunk = fh.read(chunk_size)
+            if not chunk: break
+            digest.update(chunk); total += len(chunk)
+            if bytes_per_second:
+                ahead = total / bytes_per_second - (time.monotonic() - started)
+                if ahead > 0: time.sleep(min(ahead, 0.25))
+    return digest.hexdigest()
+
+
 def phd2_quality_score(rms_total: float, peak: float, lost_frames: int,
                        frame_count: int, drift_ra: float = 0.0,
                        drift_dec: float = 0.0) -> float:
@@ -270,6 +291,26 @@ class ScanResult:
     errors: int = 0
     duplicate_groups: int = 0
     masters: int = 0
+
+
+class ScanController:
+    """Cooperative pause/cancel state shared by scan and hashing workers."""
+    def __init__(self, hash_rate_mbps: float = 80.0):
+        self.pause_event = threading.Event()
+        self.cancel_event = threading.Event()
+        self.hash_rate_mbps = max(0.0, float(hash_rate_mbps))
+
+    def pause(self): self.pause_event.set()
+    def resume(self): self.pause_event.clear()
+    def cancel(self): self.cancel_event.set()
+
+    def checkpoint(self):
+        if self.cancel_event.is_set():
+            return False
+        while self.pause_event.is_set():
+            if self.cancel_event.wait(0.2):
+                return False
+        return True
 
 
 SCHEMA = """
@@ -312,7 +353,60 @@ CREATE TABLE IF NOT EXISTS audit(
   src TEXT, dst TEXT, checksum TEXT, status TEXT NOT NULL, undoable INTEGER NOT NULL DEFAULT 0,
   undone INTEGER NOT NULL DEFAULT 0, details TEXT
 );
+CREATE TABLE IF NOT EXISTS image_quality(
+  path TEXT PRIMARY KEY, file_mtime REAL NOT NULL, capture_date TEXT, camera TEXT,
+  target TEXT, filter_name TEXT, fwhm REAL, eccentricity REAL, star_count INTEGER,
+  background REAL, noise REAL, median_snr REAL, elongation REAL, score REAL,
+  clouds_likely INTEGER NOT NULL DEFAULT 0, trailing_likely INTEGER NOT NULL DEFAULT 0,
+  focus_drift INTEGER NOT NULL DEFAULT 0, poor_frame INTEGER NOT NULL DEFAULT 0,
+  sample_step INTEGER, analysed_at TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS session_meta(
+  session_key TEXT PRIMARY KEY, rating INTEGER NOT NULL DEFAULT 0, notes TEXT NOT NULL DEFAULT '',
+  tags TEXT NOT NULL DEFAULT '', updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS target_aliases(
+  alias TEXT PRIMARY KEY COLLATE NOCASE, canonical TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS weather_samples(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, temperature REAL,
+  humidity REAL, cloud_percent REAL, wind REAL, source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_weather_timestamp ON weather_samples(timestamp);
+CREATE TABLE IF NOT EXISTS session_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, timestamp TEXT NOT NULL,
+  event_type TEXT NOT NULL, details TEXT
+);
 """
+
+
+def _write_simple_pdf(path: Path, lines):
+    """Write a small, dependency-free text PDF suitable for session reports."""
+    def esc(value):
+        text = str(value).encode("latin-1", errors="replace").decode("latin-1")
+        return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    rendered = []
+    y = 790
+    for raw in lines:
+        for line in str(raw).splitlines() or [""]:
+            if y < 45: break
+            rendered.append(f"BT /F1 10 Tf 45 {y} Td ({esc(line[:110])}) Tj ET")
+            y -= 15
+    stream = "\n".join(rendered).encode("latin-1")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    data = bytearray(b"%PDF-1.4\n"); offsets = [0]
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(data)); data.extend(f"{index} 0 obj\n".encode()); data.extend(obj); data.extend(b"\nendobj\n")
+    xref = len(data); data.extend(f"xref\n0 {len(objects)+1}\n".encode()); data.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]: data.extend(f"{offset:010d} 00000 n \n".encode())
+    data.extend(f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode())
+    path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
 
 
 class Catalog:
@@ -358,22 +452,41 @@ class Catalog:
         with self.connect() as conn:
             return self._root_id(conn, path, label, role)
 
-    def storage_roots(self) -> list[dict]:
+    def storage_roots(self, refresh_usage: bool = False) -> list[dict]:
         rows = []
         with self.connect() as conn:
             for row in conn.execute("SELECT * FROM storage_roots ORDER BY label"):
                 item = dict(row)
-                try:
-                    usage = shutil.disk_usage(item["path"])
-                    item.update(total_bytes=usage.total, free_bytes=usage.free, online=True)
-                except OSError:
-                    item["online"] = False
+                item["online"] = None  # cached; refresh explicitly so NAS paths never block startup
+                if refresh_usage:
+                    try:
+                        usage = shutil.disk_usage(item["path"])
+                        item.update(total_bytes=usage.total, free_bytes=usage.free, online=True)
+                        conn.execute("UPDATE storage_roots SET total_bytes=?,free_bytes=?,last_seen=? WHERE id=?",
+                                     (usage.total, usage.free, datetime.now().isoformat(timespec="seconds"), item["id"]))
+                    except OSError:
+                        item["online"] = False
                 rows.append(item)
         return rows
 
+    def refresh_storage_root(self, root_id: int) -> dict:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM storage_roots WHERE id=?", (root_id,)).fetchone()
+            if not row: raise KeyError(root_id)
+            item = dict(row)
+            try:
+                usage = shutil.disk_usage(item["path"])
+                now = datetime.now().isoformat(timespec="seconds")
+                conn.execute("UPDATE storage_roots SET total_bytes=?,free_bytes=?,last_seen=? WHERE id=?",
+                             (usage.total, usage.free, now, root_id))
+                item.update(total_bytes=usage.total, free_bytes=usage.free, last_seen=now, online=True)
+            except OSError:
+                item["online"] = False
+            return item
+
     def scan(self, root: Path, label: Optional[str] = None, role: str = "archive",
              progress: Optional[Callable[[int, int, Path], None]] = None,
-             hash_duplicates: bool = True) -> ScanResult:
+             hash_duplicates: bool = True, controller: Optional[ScanController] = None) -> ScanResult:
         root = Path(root).resolve()
         if not root.is_dir():
             raise FileNotFoundError(root)
@@ -390,6 +503,8 @@ class Catalog:
             root_id = self._root_id(conn, root, label or root.name or str(root), role)
             seen_paths = {str(path) for path in candidates}
             for index, path in enumerate(candidates, 1):
+                if controller and not controller.checkpoint():
+                    break
                 if progress:
                     progress(index, len(candidates), path)
                 try:
@@ -400,6 +515,8 @@ class Catalog:
                         result.unchanged += 1
                         continue
                     meta = merged_metadata(path) if path.suffix.lower() in FITS_EXTENSIONS | MASTER_EXTENSIONS else {}
+                    if meta.get("target"):
+                        meta["target"] = self._canonical_target(conn, meta["target"])
                     kind = "master" if self._is_master(path, meta) else (
                         "frame" if path.suffix.lower() in FITS_EXTENSIONS else "phd2")
                     conn.execute(
@@ -451,7 +568,7 @@ class Catalog:
                 if known["path"] not in seen_paths:
                     conn.execute("UPDATE files SET status='missing' WHERE id=?", (known["id"],))
             if hash_duplicates:
-                result.duplicate_groups = self._refresh_duplicates(conn)
+                result.duplicate_groups = self._refresh_duplicates(conn, controller)
             self._associate_masters(conn)
         return result
 
@@ -482,18 +599,26 @@ class Catalog:
             integration = integration or int(match.group(1)) * float(match.group(2))
         return sub_count, integration
 
-    def _refresh_duplicates(self, conn) -> int:
+    @staticmethod
+    def _canonical_target(conn, target: str) -> str:
+        row = conn.execute("SELECT canonical FROM target_aliases WHERE alias=? COLLATE NOCASE", (target,)).fetchone()
+        return row[0] if row else target
+
+    def _refresh_duplicates(self, conn, controller: Optional[ScanController] = None) -> int:
         rows = conn.execute(
             "SELECT size,COUNT(*) n FROM files WHERE status='active' GROUP BY size HAVING n>1"
         ).fetchall()
         for group in rows:
             files = conn.execute("SELECT id,path,sha256 FROM files WHERE size=? AND status='active'", (group["size"],)).fetchall()
             for item in files:
+                if controller and not controller.checkpoint():
+                    return 0
                 if not item["sha256"]:
                     try:
-                        digest = sha256_file(Path(item["path"]))
+                        digest = sha256_file_limited(
+                            Path(item["path"]), controller.hash_rate_mbps if controller else 0.0, controller)
                         conn.execute("UPDATE files SET sha256=? WHERE id=?", (digest, item["id"]))
-                    except OSError:
+                    except (OSError, InterruptedError):
                         pass
         conn.execute("UPDATE files SET backup_count=0")
         duplicate_rows = conn.execute(
@@ -649,6 +774,238 @@ class Catalog:
     def phd2_quality_rows(self) -> list[dict]:
         with self.connect() as conn:
             return [dict(row) for row in conn.execute("SELECT * FROM phd2_quality ORDER BY capture_date DESC,path")]
+
+    @staticmethod
+    def session_key(capture_date, camera, target):
+        return "|".join(str(v or "") for v in (capture_date, camera, target))
+
+    def pending_quality_paths(self, limit: int = 0) -> list[Path]:
+        sql = """SELECT f.path FROM files f LEFT JOIN image_quality q ON q.path=f.path
+                 WHERE f.status='active' AND f.kind='frame'
+                 AND lower(f.frame_type) LIKE '%light%'
+                 AND (q.path IS NULL OR q.file_mtime<>f.mtime)
+                 ORDER BY f.capture_date,f.path"""
+        params = ()
+        if limit:
+            sql += " LIMIT ?"; params = (int(limit),)
+        with self.connect() as conn:
+            return [Path(row[0]) for row in conn.execute(sql, params)]
+
+    def record_image_quality(self, result: QualityResult):
+        with self.connect() as conn:
+            file_row = conn.execute(
+                "SELECT mtime,capture_date,camera,target,filter_name FROM files WHERE path=?",
+                (result.path,),
+            ).fetchone()
+            if not file_row:
+                return False
+            conn.execute(
+                """INSERT INTO image_quality(path,file_mtime,capture_date,camera,target,filter_name,
+                   fwhm,eccentricity,star_count,background,noise,median_snr,elongation,score,
+                   clouds_likely,trailing_likely,poor_frame,sample_step,analysed_at,error)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(path) DO UPDATE SET file_mtime=excluded.file_mtime,
+                   capture_date=excluded.capture_date,camera=excluded.camera,target=excluded.target,
+                   filter_name=excluded.filter_name,fwhm=excluded.fwhm,
+                   eccentricity=excluded.eccentricity,star_count=excluded.star_count,
+                   background=excluded.background,noise=excluded.noise,median_snr=excluded.median_snr,
+                   elongation=excluded.elongation,score=excluded.score,
+                   clouds_likely=excluded.clouds_likely,trailing_likely=excluded.trailing_likely,
+                   poor_frame=excluded.poor_frame,sample_step=excluded.sample_step,
+                   analysed_at=excluded.analysed_at,error=excluded.error""",
+                (result.path, file_row["mtime"], file_row["capture_date"], file_row["camera"],
+                 file_row["target"], file_row["filter_name"], result.fwhm, result.eccentricity,
+                 result.star_count, result.background, result.noise, result.median_snr,
+                 result.elongation, result.score, int(result.clouds_likely),
+                 int(result.trailing_likely), int(result.poor_frame), result.sample_step,
+                 result.analysed_at, result.error),
+            )
+        return True
+
+    def analyse_pending_quality(self, batch: Optional[QualityBatch] = None,
+                                callback: Optional[Callable] = None, limit: int = 0):
+        batch = batch or QualityBatch()
+        paths = self.pending_quality_paths(limit)
+        def finished(index, total, path, result, eta):
+            self.record_image_quality(result)
+            if callback: callback(index, total, path, result, eta)
+        results = batch.run(paths, finished)
+        self._refine_session_quality()
+        return results
+
+    def _refine_session_quality(self):
+        with self.connect() as conn:
+            groups = conn.execute(
+                """SELECT capture_date,camera,target FROM image_quality
+                   WHERE error='' GROUP BY capture_date,camera,target"""
+            ).fetchall()
+            for group in groups:
+                rows = conn.execute(
+                    """SELECT path,fwhm,star_count,background,score,clouds_likely,
+                              trailing_likely FROM image_quality
+                       WHERE capture_date IS ? AND camera IS ? AND target IS ? AND error=''
+                       ORDER BY analysed_at,path""", tuple(group)
+                ).fetchall()
+                if len(rows) < 3: continue
+                stars = sorted(r["star_count"] for r in rows if r["star_count"] > 0)
+                backgrounds = sorted(r["background"] for r in rows)
+                fwhms = [r["fwhm"] for r in rows if r["fwhm"] > 0]
+                median_stars = stars[len(stars)//2] if stars else 0
+                median_bg = backgrounds[len(backgrounds)//2] if backgrounds else 0
+                focus_drift = False
+                if len(fwhms) >= 6:
+                    third = max(2, len(fwhms)//3)
+                    first = sorted(fwhms[:third])[third//2]
+                    last = sorted(fwhms[-third:])[third//2]
+                    focus_drift = last > first * 1.2 and last - first > 0.5
+                for row in rows:
+                    relative_cloud = bool(
+                        (median_stars and row["star_count"] < median_stars * 0.5) or
+                        (median_bg and row["background"] > median_bg * 1.5)
+                    )
+                    clouds = bool(row["clouds_likely"] or relative_cloud)
+                    score = max(0.0, float(row["score"]) - (15.0 if relative_cloud else 0.0))
+                    poor = score < 50 or clouds or bool(row["trailing_likely"])
+                    conn.execute(
+                        "UPDATE image_quality SET clouds_likely=?,focus_drift=?,poor_frame=?,score=? WHERE path=?",
+                        (int(clouds), int(focus_drift), int(poor), round(score, 1), row["path"]),
+                    )
+
+    def quality_rows(self, capture_date=None, camera=None, target=None) -> list[dict]:
+        clauses = ["1=1"]; params = []
+        for column, value in (("capture_date", capture_date), ("camera", camera), ("target", target)):
+            if value is not None:
+                clauses.append(f"{column} IS ?"); params.append(value)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM image_quality WHERE {' AND '.join(clauses)} ORDER BY capture_date,path",
+                params,
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def set_session_meta(self, capture_date, camera, target, rating=0, notes="", tags=""):
+        key = self.session_key(capture_date, camera, target)
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO session_meta(session_key,rating,notes,tags,updated_at) VALUES(?,?,?,?,?)
+                   ON CONFLICT(session_key) DO UPDATE SET rating=excluded.rating,notes=excluded.notes,
+                   tags=excluded.tags,updated_at=excluded.updated_at""",
+                (key, max(0, min(5, int(rating))), str(notes), str(tags),
+                 datetime.now().isoformat(timespec="seconds")),
+            )
+
+    def set_target_alias(self, alias: str, canonical: str):
+        alias, canonical = alias.strip(), canonical.strip()
+        if not alias or not canonical: raise ValueError("Alias and canonical target are required")
+        with self.connect() as conn:
+            conn.execute("INSERT INTO target_aliases(alias,canonical) VALUES(?,?) ON CONFLICT(alias) DO UPDATE SET canonical=excluded.canonical",
+                         (alias, canonical))
+            conn.execute("UPDATE files SET target=? WHERE target=? COLLATE NOCASE", (canonical, alias))
+            conn.execute("UPDATE image_quality SET target=? WHERE target=? COLLATE NOCASE", (canonical, alias))
+
+    def target_aliases(self):
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT alias,canonical FROM target_aliases ORDER BY canonical,alias")]
+
+    def session_detail(self, capture_date, camera, target) -> dict:
+        key = self.session_key(capture_date, camera, target)
+        with self.connect() as conn:
+            files = [dict(row) for row in conn.execute(
+                """SELECT f.*,q.fwhm,q.eccentricity,q.star_count,q.background,q.score,
+                          q.clouds_likely,q.trailing_likely,q.focus_drift,q.poor_frame
+                   FROM files f LEFT JOIN image_quality q ON q.path=f.path
+                   WHERE f.status='active' AND f.capture_date IS ? AND f.camera IS ? AND f.target IS ?
+                   ORDER BY f.frame_type,f.filter_name,f.path""", (capture_date, camera, target))]
+            master_ids = {r["master_id"] for r in files if r.get("master_id")}
+            masters = []
+            if master_ids:
+                placeholders = ",".join("?" for _ in master_ids)
+                masters = [dict(row) for row in conn.execute(f"SELECT * FROM masters WHERE id IN ({placeholders})", tuple(master_ids))]
+            phd2 = [dict(row) for row in conn.execute("SELECT * FROM phd2_quality WHERE capture_date IS ? ORDER BY path", (capture_date,))]
+            weather = [dict(row) for row in conn.execute("SELECT * FROM weather_samples WHERE timestamp LIKE ? ORDER BY timestamp", (f"{capture_date or ''}%",))]
+            meta = conn.execute("SELECT * FROM session_meta WHERE session_key=?", (key,)).fetchone()
+            events = [dict(row) for row in conn.execute("SELECT * FROM session_events WHERE session_key=? ORDER BY timestamp", (key,))]
+        return {"session_key": key, "capture_date": capture_date, "camera": camera,
+                "target": target, "files": files, "masters": masters, "phd2": phd2,
+                "weather": weather, "meta": dict(meta) if meta else {"rating":0,"notes":"","tags":""},
+                "events": events}
+
+    def record_session_event(self, capture_date, camera, target, event_type, details=""):
+        with self.connect() as conn:
+            conn.execute("INSERT INTO session_events(session_key,timestamp,event_type,details) VALUES(?,?,?,?)",
+                         (self.session_key(capture_date,camera,target), datetime.now().isoformat(timespec="seconds"),
+                          event_type, str(details)))
+
+    def import_weather_csv(self, path: Path) -> int:
+        aliases = {"time":"timestamp","datetime":"timestamp","date":"timestamp",
+                   "temp":"temperature","temperature_c":"temperature",
+                   "rh":"humidity","cloud":"cloud_percent","clouds":"cloud_percent",
+                   "wind_speed":"wind"}
+        count = 0
+        with Path(path).open("r", encoding="utf-8-sig", newline="") as fh, self.connect() as conn:
+            for source in csv.DictReader(fh):
+                row = {aliases.get(k.strip().lower(), k.strip().lower()): v for k,v in source.items() if k}
+                timestamp = row.get("timestamp")
+                if not timestamp: continue
+                def num(key):
+                    try: return float(row.get(key))
+                    except (TypeError, ValueError): return None
+                conn.execute("INSERT INTO weather_samples(timestamp,temperature,humidity,cloud_percent,wind,source) VALUES(?,?,?,?,?,?)",
+                             (timestamp, num("temperature"), num("humidity"), num("cloud_percent"), num("wind"), str(path)))
+                count += 1
+        return count
+
+    def backup_database(self, destination: Path):
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(str(self.db_path)); target = sqlite3.connect(str(destination))
+        try: source.backup(target)
+        finally: source.close(); target.close()
+        check = sqlite3.connect(str(destination))
+        try:
+            if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("Backup integrity verification failed")
+        finally:
+            check.close()
+        return destination
+
+    def database_health(self, repair=False) -> dict:
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
+        try:
+            before = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            if repair and before != "ok": conn.execute("REINDEX")
+            conn.commit()
+            if repair: conn.execute("VACUUM")
+            after = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            conn.close()
+        return {"before": before, "after": after, "ok": after == "ok"}
+
+    def export_session_csv(self, capture_date, camera, target, destination: Path):
+        detail = self.session_detail(capture_date, camera, target)
+        fields = ["path","frame_type","filter_name","exposure","gain","temperature","fwhm",
+                  "eccentricity","star_count","background","score","clouds_likely",
+                  "trailing_likely","focus_drift","poor_frame"]
+        with Path(destination).open("w", newline="", encoding="utf-8-sig") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader(); writer.writerows(detail["files"])
+        return Path(destination)
+
+    def export_session_pdf(self, capture_date, camera, target, destination: Path):
+        detail = self.session_detail(capture_date, camera, target)
+        quality = [r for r in detail["files"] if r.get("score") is not None]
+        lines = ["ASIAIR SESSION REPORT", f"Date: {capture_date or 'Unknown'}",
+                 f"Camera: {camera or 'Unknown'}", f"Target: {target or 'Unknown'}",
+                 f"Files: {len(detail['files'])}", f"Masters: {len(detail['masters'])}",
+                 f"PHD2 sessions: {len(detail['phd2'])}"]
+        if quality:
+            lines += [f"Average quality: {sum(r['score'] for r in quality)/len(quality):.1f}/100",
+                      f"Poor frames: {sum(bool(r.get('poor_frame')) for r in quality)}"]
+        meta = detail["meta"]
+        lines += [f"Rating: {meta.get('rating',0)}/5", f"Tags: {meta.get('tags','')}",
+                  "", "Notes:", meta.get("notes","")]
+        _write_simple_pdf(Path(destination), lines)
+        return Path(destination)
 
     def record_audit(self, operation: str, src=None, dst=None, checksum=None,
                      status="complete", undoable=False, details=None):

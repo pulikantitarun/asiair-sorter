@@ -1,4 +1,5 @@
 import os
+import csv
 import struct
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from astro_catalog import (
     read_xisf_metadata,
     sha256_file,
 )
+from image_quality import QualityResult
 
 
 def fits_card(key, value):
@@ -179,6 +181,33 @@ class CatalogTests(unittest.TestCase):
         self.assertGreater(good, bad)
         self.assertGreaterEqual(good, 0)
         self.assertLessEqual(good, 100)
+
+    def test_session_metadata_alias_quality_and_reports(self):
+        archive = self.root / "archive"
+        raw = archive / "Light_NGC 1976_120s_Bin1_ASI533MM_Ha_gain100_20261115-200102.fit"
+        write_fits(raw, target="NGC 1976")
+        self.catalog.scan(archive, hash_duplicates=False)
+        self.catalog.set_target_alias("NGC 1976", "M 42")
+        self.catalog.set_session_meta("2026-11-15", "ASI533MM", "M 42", 5, "Clear night", "keeper,ha")
+        self.catalog.record_image_quality(QualityResult(
+            path=str(raw.resolve()), fwhm=3.1, eccentricity=.42, star_count=120,
+            background=1000, noise=8, median_snr=25, elongation=1.1, score=88,
+            analysed_at="2026-11-15T20:00:00"))
+        detail = self.catalog.session_detail("2026-11-15", "ASI533MM", "M 42")
+        self.assertEqual(detail["meta"]["rating"], 5)
+        self.assertEqual(detail["files"][0]["score"], 88)
+        csv_path = self.catalog.export_session_csv("2026-11-15", "ASI533MM", "M 42", self.root/"report.csv")
+        pdf_path = self.catalog.export_session_pdf("2026-11-15", "ASI533MM", "M 42", self.root/"report.pdf")
+        self.assertIn("fwhm", csv_path.read_text(encoding="utf-8-sig"))
+        self.assertTrue(pdf_path.read_bytes().startswith(b"%PDF-1.4"))
+
+    def test_database_backup_and_weather_import(self):
+        weather = self.root / "weather.csv"
+        weather.write_text("timestamp,temp,rh,cloud,wind_speed\n2026-11-15T20:00:00,18,55,12,4\n", encoding="utf-8")
+        self.assertEqual(self.catalog.import_weather_csv(weather), 1)
+        backup = self.catalog.backup_database(self.root / "backup.sqlite3")
+        self.assertTrue(backup.is_file())
+        self.assertTrue(self.catalog.database_health()["ok"])
 
 
 if __name__ == "__main__":

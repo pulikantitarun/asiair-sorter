@@ -3,7 +3,7 @@
 ; ============================================================
 
 #define AppName      "ASIAIR Session Sorter"
-#define AppVersion   "3.0"
+#define AppVersion   "3.1"
 #define AppPublisher "pulikantitarun"
 #define AppExeName   "ASIAIR_Sorter.exe"
 

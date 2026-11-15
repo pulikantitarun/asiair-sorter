@@ -9,6 +9,12 @@ dist/
 build/
 dist-v3/
 build-v3/
+build-v3-v31/
+build-deps-v31/
+python-full-v31/
+python-install-v31*.log
+installer-v31-install.log
+hooks-v31/
 build-deps-v3/
 tcl-build/
 installer_output/

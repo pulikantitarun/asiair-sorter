@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         ASIAIR Astrophotography Session Sorter  v3.0         ║
+║         ASIAIR Astrophotography Session Sorter  v3.1         ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage (from source):
@@ -59,10 +59,13 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 from typing import List, Optional
+from PIL import Image
 
 from astro_catalog import (
-    Catalog, SourceWatcher, merged_metadata, phd2_quality_score, sha256_file,
+    Catalog, ScanController, SourceWatcher, merged_metadata, phd2_quality_score, sha256_file,
 )
+from image_quality import QualityBatch, create_thumbnail
+from device_automation import discover_asiair_sources, eject_source
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS — edit here to customise output folder names
@@ -92,7 +95,7 @@ _LIGHT_CAMERA_RE = re.compile(
     re.IGNORECASE,
 )
 _INVALID_FOLDER_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
-VERSION     = "3.0"
+VERSION     = "3.1"
 
 # ── UI palette ────────────────────────────────────────────────────────────────
 BG_APP     = "#0d1117"
@@ -1135,9 +1138,13 @@ class SortFrame(ctk.CTkFrame):
         self.src_var  = tk.StringVar(value=cfg.get("source",""))
         self.dst_var  = tk.StringVar(value=cfg.get("dest",""))
         self.dry_var  = tk.BooleanVar(value=False)
+        self.eject_var = tk.BooleanVar(value=False)
         self.prog_var = tk.DoubleVar(value=0.0)
         self._running = False
+        self._run_lines = []
+        self._preview_report_requested = False
         self._build_ui()
+        self.after(800, self._detect_sources)
 
     def _build_ui(self):
         FolderCard(self, "⬤  SD Card / Asiair Source Folder",
@@ -1153,6 +1160,9 @@ class SortFrame(ctk.CTkFrame):
                         font=ctk.CTkFont(size=12), text_color=FG_TEXT,
                         checkmark_color="#ffffff", border_color=BORDER,
                         ).pack(side="left", padx=(0,20))
+        ctk.CTkCheckBox(ctrl, text="Eject after verified copy",
+                        variable=self.eject_var, font=ctk.CTkFont(size=11),
+                        text_color=FG_MUTED, border_color=BORDER).pack(side="left", padx=(0,12))
         self.cancel_btn = ctk.CTkButton(
             ctrl, text="■  Cancel", width=110, height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
@@ -1160,14 +1170,14 @@ class SortFrame(ctk.CTkFrame):
             state="disabled", command=self._cancel)
         self.cancel_btn.pack(side="right", padx=(6,0))
         self.move_btn = ctk.CTkButton(
-            ctrl, text="✂  Move Files", width=130, height=36,
+            ctrl, text="Preview Report", width=130, height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=BTN_MOVE, hover_color="#3d444d",
             border_color=BORDER, border_width=1,
-            command=lambda: self._start("move"))
+            command=self._start_preview)
         self.move_btn.pack(side="right", padx=(6,0))
         self.copy_btn = ctk.CTkButton(
-            ctrl, text="▶  Copy Files", width=130, height=36,
+            ctrl, text="▶  Copy + Verify", width=140, height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HL,
             command=lambda: self._start("copy"))
@@ -1230,6 +1240,7 @@ class SortFrame(ctk.CTkFrame):
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _log(self, msg: str, tag: str="info"):
+        self._run_lines.append(msg)
         def _u():
             self.log.configure(state="normal")
             self.log.insert("end", msg+"\n", tag)
@@ -1261,17 +1272,22 @@ class SortFrame(ctk.CTkFrame):
                 self.cancel_btn.configure(state="disabled")
         self.after(0, _u)
 
-    def _start(self, mode):
+    def _start_preview(self):
+        self._preview_report_requested = True
+        self._start("copy", dry_override=True)
+
+    def _start(self, mode, dry_override=None):
         src = self.src_var.get().strip(); dst = self.dst_var.get().strip()
         if not src: messagebox.showerror("Missing source","Please select a source folder."); return
         if not dst: messagebox.showerror("Missing destination","Please select a destination folder."); return
         if not Path(src).is_dir(): messagebox.showerror("Invalid source", f"Not found:\n{src}"); return
         if Path(src) == Path(dst): messagebox.showerror("Same folder","Source and destination must differ."); return
         save_config({"source":src,"dest":dst})
-        self._clear_log(); self._set_progress(0)
+        self._clear_log(); self._set_progress(0); self._run_lines = []
         self._running = True; self._set_busy(True)
         threading.Thread(target=self._worker,
-                         args=(Path(src),Path(dst),mode,self.dry_var.get()),
+                         args=(Path(src),Path(dst),mode,
+                               self.dry_var.get() if dry_override is None else dry_override),
                          daemon=True).start()
 
     def _cancel(self):
@@ -1283,12 +1299,19 @@ class SortFrame(ctk.CTkFrame):
         except Exception as e: self._log(f"\nFATAL ERROR: {e}","err")
         finally:
             self._running = False; self._set_busy(False)
+            if dry_run and self._preview_report_requested:
+                self._preview_report_requested = False
+                report_dir = self.catalog.db_path.parent / "import_reports"
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report = report_dir / f"import_preview_{datetime.now():%Y%m%d_%H%M%S}.txt"
+                report.write_text("\n".join(self._run_lines), encoding="utf-8")
+                self.after(0, lambda: messagebox.showinfo("Import preview ready", f"No files were changed.\n\nReport saved to:\n{report}"))
             if self._on_complete and not dry_run:
                 self.after(0, self._on_complete)
 
     def _sort(self, src, dst, mode, dry_run):
         label  = "[DRY RUN]  " if dry_run else ""
-        action = "move" if mode=="move" else "copy"
+        action = "copy"
         SEP    = "─"*62
         self._log(SEP,"hdr")
         self._log(f"{label}{action.upper()}  ·  {datetime.now():%Y-%m-%d  %H:%M:%S}","hdr")
@@ -1346,11 +1369,14 @@ class SortFrame(ctk.CTkFrame):
             if not dry_run:
                 try:
                     dest_fp.parent.mkdir(parents=True, exist_ok=True)
-                    (shutil.move if mode=="move" else shutil.copy2)(str(fp),str(dest_fp))
-                    checksum = sha256_file(dest_fp) if mode == "copy" else None
-                    self.catalog.record_audit(mode, fp, dest_fp, checksum,
+                    shutil.copy2(str(fp),str(dest_fp))
+                    source_checksum = sha256_file(fp)
+                    checksum = sha256_file(dest_fp)
+                    if source_checksum != checksum:
+                        raise OSError("Checksum verification failed; source was left untouched")
+                    self.catalog.record_audit("copy", fp, dest_fp, checksum,
                                               undoable=True,
-                                              details=json.dumps({"frame_type": info["frame_type"]}))
+                                              details=json.dumps({"frame_type": info["frame_type"], "verified": True}))
                 except OSError as e:
                     self._log(f"    ✗  {e}","err"); counts["err"]+=1; success=False
 
@@ -1367,6 +1393,8 @@ class SortFrame(ctk.CTkFrame):
                     sdir.mkdir(parents=True, exist_ok=True)
                     write_session_summary(sdir, date, target or None,
                                           camera or None, entries, action)
+                    self.catalog.record_session_event(date, camera or None, target or None,
+                                                      "capture_imported", f"{len(entries)} verified file(s)")
                     try: disp = sdir.relative_to(dst)
                     except ValueError: disp = sdir
                     self._log(f"  ✓  session_summary.txt  →  {disp}","ok")
@@ -1388,6 +1416,29 @@ class SortFrame(ctk.CTkFrame):
             f"{'Done' if not cancelled else 'Cancelled'}  —  "
             f"{total_frm} frames {action}d  ·  "
             f"{counts['deleted']} preview(s) removed from SD")
+        if (not dry_run and not cancelled and not counts["err"] and self.eject_var.get()):
+            ok, message = eject_source(src)
+            self._log(f"  {'EJECTED' if ok else 'EJECT FAILED'}  {message}", "ok" if ok else "err")
+            self.after(0, lambda: messagebox.showinfo("ASIAIR source", message) if ok else
+                       messagebox.showwarning("Could not eject source", message))
+        elif not dry_run and not cancelled and not counts["err"]:
+            self.after(0, lambda: messagebox.showinfo(
+                "Verified import complete",
+                f"{total_frm} file(s) were copied and verified.\n\nRaw FITS files remain on the source."))
+
+    def _detect_sources(self):
+        self.after(30000, self._detect_sources)
+        if self._running: return
+        def work():
+            sources = discover_asiair_sources()
+            if sources:
+                def show():
+                    current = self.src_var.get().strip()
+                    if not current or not Path(current).is_dir():
+                        self.src_var.set(str(sources[0]))
+                    self.status_lbl.configure(text=f"Detected ASIAIR source: {sources[0]}")
+                self.after(0, show)
+        threading.Thread(target=work, daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1410,6 +1461,11 @@ class LibraryFrame(ctk.CTkFrame):
         self._watch_var = tk.BooleanVar(value=False)
         self._status_var = tk.StringVar(value="Catalogue ready")
         self._search_var = tk.StringVar()
+        self._session_var = tk.StringVar(value="No sessions indexed")
+        self._session_values = {}
+        self._scan_controller = None
+        self._quality_batch = None
+        self._thumb_image = None
         self._build_ui()
         self.after(150, self.refresh)
 
@@ -1424,6 +1480,10 @@ class LibraryFrame(ctk.CTkFrame):
         ctk.CTkButton(bar, text="Scan Destination", width=120,
                       command=self.scan_configured).pack(side="right", padx=4, pady=8)
         ctk.CTkButton(bar, text="Refresh", width=70, command=self.refresh).pack(side="right", padx=4, pady=8)
+        ctk.CTkButton(bar, text="Cancel", width=60, fg_color=BTN_CANCEL,
+                      command=self._cancel_scan).pack(side="right", padx=4, pady=8)
+        ctk.CTkButton(bar, text="Pause", width=60,
+                      command=self._pause_scan).pack(side="right", padx=4, pady=8)
         ctk.CTkCheckBox(bar, text="Watch ASIAIR", variable=self._watch_var,
                         command=self._toggle_watcher, text_color=FG_MUTED,
                         border_color=BORDER).pack(side="right", padx=10)
@@ -1433,7 +1493,7 @@ class LibraryFrame(ctk.CTkFrame):
                                    segmented_button_selected_color=ACCENT)
         self.tabs.pack(fill="both", expand=True)
         self._boxes = {}
-        for name in ("Overview", "Sessions", "Masters", "Targets", "Search",
+        for name in ("Overview", "Sessions", "Session", "Quality", "Masters", "Targets", "Search",
                      "Cleanup", "Duplicates", "Storage", "Audit"):
             self.tabs.add(name)
             tab = self.tabs.tab(name)
@@ -1442,6 +1502,25 @@ class LibraryFrame(ctk.CTkFrame):
             if name == "Targets":
                 ctk.CTkButton(controls, text="Set Integration Goal…", width=150,
                               command=self._set_goal).pack(side="left")
+                ctk.CTkButton(controls, text="Target Alias…", width=110,
+                              command=self._set_alias).pack(side="left", padx=6)
+            elif name == "Session":
+                self._session_combo = ctk.CTkComboBox(
+                    controls, variable=self._session_var, values=["No sessions indexed"], width=330,
+                    fg_color=BG_INPUT, border_color=BORDER, button_color=ACCENT)
+                self._session_combo.pack(side="left", padx=(0,6))
+                for label, command in (("Open",self._open_session),("Notes",self._edit_session),
+                                       ("CSV",lambda: self._export_session("csv")),
+                                       ("PDF",lambda: self._export_session("pdf")),
+                                       ("Weather CSV",self._import_weather)):
+                    ctk.CTkButton(controls, text=label, width=75, command=command).pack(side="left", padx=2)
+            elif name == "Quality":
+                ctk.CTkButton(controls, text="Analyse Pending Lights", width=160,
+                              command=self._analyse_quality).pack(side="left")
+                ctk.CTkButton(controls, text="Pause / Resume", width=110,
+                              command=self._pause_quality).pack(side="left", padx=6)
+                ctk.CTkButton(controls, text="Cancel", width=70, fg_color=BTN_CANCEL,
+                              command=self._cancel_quality).pack(side="left")
             elif name == "Search":
                 ctk.CTkEntry(controls, textvariable=self._search_var,
                              placeholder_text="Target, camera, filter, date or path",
@@ -1457,11 +1536,21 @@ class LibraryFrame(ctk.CTkFrame):
             elif name == "Storage":
                 ctk.CTkButton(controls, text="Add PC / NAS / Cloud Folder…", width=190,
                               command=self._add_storage).pack(side="left")
+                ctk.CTkButton(controls, text="Refresh Status", width=110,
+                              command=self._refresh_storage).pack(side="left", padx=6)
             elif name == "Audit":
                 ctk.CTkButton(controls, text="Undo Operation…", width=130,
                               command=self._undo).pack(side="left")
+                ctk.CTkButton(controls, text="Backup Database…", width=130,
+                              command=self._backup_database).pack(side="left", padx=6)
+                ctk.CTkButton(controls, text="Check / Repair", width=110,
+                              command=self._check_database).pack(side="left")
             else:
                 ctk.CTkLabel(controls, text=" ").pack(side="left")
+            if name == "Session":
+                self._thumbnail_label = ctk.CTkLabel(tab, text="Select a session to show a light-frame thumbnail.",
+                                                     height=170, text_color=FG_MUTED)
+                self._thumbnail_label.pack(fill="x", padx=4, pady=4)
             box = ctk.CTkTextbox(tab, fg_color=BG_LOG, text_color=FG_TEXT,
                                  font=("Consolas", 10), wrap="none")
             box.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1495,6 +1584,21 @@ class LibraryFrame(ctk.CTkFrame):
             f"{r['capture_date'] or 'Unknown':<12}  {(r['camera'] or 'Unknown'):<18}  {(r['target'] or 'Unknown'):<24} "
             f"{r['files']:>5} files  {r['integration_seconds']/3600:>7.2f} h  {_human_bytes(r['bytes'])}"
             for r in self.catalog.sessions()))
+        sessions = self.catalog.sessions()
+        self._session_values = {
+            f"{r['capture_date'] or 'Unknown'} · {r['camera'] or 'Unknown'} · {r['target'] or 'Unknown'}":
+            (r["capture_date"], r["camera"], r["target"]) for r in sessions}
+        values = list(self._session_values) or ["No sessions indexed"]
+        self._session_combo.configure(values=values)
+        if self._session_var.get() not in self._session_values:
+            self._session_var.set(values[0])
+        quality = self.catalog.quality_rows()
+        self._write("Quality", "\n".join(
+            f"{r['score']:>5.1f}/100  FWHM {r['fwhm']:>6.2f}px  Ecc {r['eccentricity']:>5.3f}  "
+            f"Stars {r['star_count']:>5}  BG {r['background']:>9.1f}  "
+            f"{'CLOUD ' if r['clouds_likely'] else ''}{'TRAIL ' if r['trailing_likely'] else ''}"
+            f"{'FOCUS-DRIFT ' if r['focus_drift'] else ''}{'POOR' if r['poor_frame'] else ''}\n  {r['path']}"
+            for r in sorted(quality, key=lambda row: (row['score'], row['path']), reverse=True)))
         self._write("Masters", "\n\n".join(
             f"{'VERIFIED' if r['verified'] else 'UNVERIFIED'}  {r['target'] or 'Unknown'} / {r['filter_name'] or 'No filter'}\n"
             f"  {r['sub_count'] or '?'} subs · {(r['integration_seconds'] or 0)/3600:.2f} h · SHA256 {(r['checksum'] or 'none')[:16]}…\n  {r['path']}"
@@ -1513,7 +1617,7 @@ class LibraryFrame(ctk.CTkFrame):
             f"{r['copies']} copies · {_human_bytes(r['size'])} each · SHA256 {r['sha256'][:16]}…\n{r['paths']}"
             for r in self.catalog.duplicate_groups()))
         self._write("Storage", "\n\n".join(
-            f"{'ONLINE ' if r['online'] else 'OFFLINE'}  {r['label']} [{r['role']}]\n"
+            f"{('ONLINE ' if r['online'] else 'OFFLINE') if r['online'] is not None else 'CACHED '}  {r['label']} [{r['role']}]\n"
             f"  Free {_human_bytes(r.get('free_bytes'))} / {_human_bytes(r.get('total_bytes'))}\n  {r['path']}"
             for r in roots))
         self._write("Audit", "\n".join(
@@ -1542,15 +1646,31 @@ class LibraryFrame(ctk.CTkFrame):
 
     def _scan(self, path, label, role):
         self._status_var.set(f"Scanning {path}…")
+        self._scan_controller = ScanController(hash_rate_mbps=50)
         def work():
+            started = __import__('time').monotonic()
             try:
                 result = self.catalog.scan(path, label, role,
-                    progress=lambda i,n,p: self.after(0, lambda i=i,n=n: self._status_var.set(f"Indexing {i}/{n}…")))
+                    controller=self._scan_controller,
+                    progress=lambda i,n,p: self.after(0, lambda i=i,n=n,started=started:
+                        self._status_var.set(f"Indexing {i}/{n} · ETA {((__import__('time').monotonic()-started)/max(i,1)*(n-i)):.0f}s")))
                 text = (f"Scan complete · {result.indexed} new · {result.updated} updated · "
                         f"{result.unchanged} unchanged · {result.masters} masters · {result.errors} errors")
             except Exception as exc: text = f"Scan failed: {exc}"
+            self._scan_controller = None
             self.after(0, lambda: (self._status_var.set(text), self.refresh()))
         threading.Thread(target=work, daemon=True).start()
+
+    def _pause_scan(self):
+        if not self._scan_controller: return
+        if self._scan_controller.pause_event.is_set():
+            self._scan_controller.resume(); self._status_var.set("Scan resumed")
+        else:
+            self._scan_controller.pause(); self._status_var.set("Scan paused")
+
+    def _cancel_scan(self):
+        if self._scan_controller:
+            self._scan_controller.cancel(); self._status_var.set("Cancelling scan…")
 
     def _set_goal(self):
         target = simpledialog.askstring("Target goal", "Target name:", parent=self)
@@ -1558,6 +1678,131 @@ class LibraryFrame(ctk.CTkFrame):
         filt = simpledialog.askstring("Target goal", "Filter (leave blank for none):", parent=self) or ""
         hours = simpledialog.askfloat("Target goal", "Integration goal in hours:", minvalue=0, parent=self)
         if hours is not None: self.catalog.set_target_goal(target, filt, hours); self.refresh()
+
+    def _set_alias(self):
+        alias = simpledialog.askstring("Target alias", "Alias currently found in files (for example NGC 1976):", parent=self)
+        if not alias: return
+        canonical = simpledialog.askstring("Target alias", "Canonical target name (for example M 42):", parent=self)
+        if not canonical: return
+        try: self.catalog.set_target_alias(alias, canonical)
+        except ValueError as exc: messagebox.showerror("Alias", str(exc)); return
+        self.refresh()
+
+    def _selected_session(self):
+        value = self._session_values.get(self._session_var.get())
+        if not value: messagebox.showinfo("Session", "Choose an indexed session first.")
+        return value
+
+    def _open_session(self):
+        selected = self._selected_session()
+        if not selected: return
+        detail = self.catalog.session_detail(*selected)
+        files, meta = detail["files"], detail["meta"]
+        quality = [row for row in files if row.get("score") is not None]
+        lines = [
+            f"SESSION  {detail['capture_date'] or 'Unknown'} · {detail['camera'] or 'Unknown'} · {detail['target'] or 'Unknown'}",
+            "="*96,
+            f"Rating: {'★'*meta.get('rating',0)}{'☆'*(5-meta.get('rating',0))}    Tags: {meta.get('tags','')}",
+            f"Files: {len(files)}    Masters: {len(detail['masters'])}    PHD2: {len(detail['phd2'])}    Weather samples: {len(detail['weather'])}",
+        ]
+        if quality:
+            lines += [f"Quality average: {sum(r['score'] for r in quality)/len(quality):.1f}/100    "
+                      f"Poor: {sum(bool(r.get('poor_frame')) for r in quality)}    "
+                      f"Cloud warnings: {sum(bool(r.get('clouds_likely')) for r in quality)}    "
+                      f"Trails: {sum(bool(r.get('trailing_likely')) for r in quality)}"]
+        if detail["phd2"]:
+            lines += [f"Guiding: {sum(r['score'] for r in detail['phd2'])/len(detail['phd2']):.1f}/100 average quality"]
+        if detail["weather"]:
+            temps = [r['temperature'] for r in detail['weather'] if r['temperature'] is not None]
+            clouds = [r['cloud_percent'] for r in detail['weather'] if r['cloud_percent'] is not None]
+            lines += [f"Weather: temperature {sum(temps)/len(temps):.1f} C" if temps else "Weather: temperature unavailable",
+                      f"         cloud {sum(clouds)/len(clouds):.0f}% average" if clouds else "         cloud unavailable"]
+        lines += ["", "NOTES", meta.get("notes","") or "No notes.", "", "TIMELINE"]
+        lines += [f"{r['timestamp']}  {r['event_type']}  {r['details'] or ''}" for r in detail["events"]] or ["No timeline events yet."]
+        lines += ["", "FILES"]
+        for row in files:
+            q = f" Q {row['score']:.1f}" if row.get("score") is not None else ""
+            flags = (" CLOUD" if row.get("clouds_likely") else "") + (" TRAIL" if row.get("trailing_likely") else "")
+            lines.append(f"{(row.get('frame_type') or row.get('kind') or ''):<9} {(row.get('filter_name') or ''):<7}{q:<9}{flags:<14} {row['path']}")
+        lines += ["", "MASTERS"] + [m["path"] for m in detail["masters"]]
+        self._write("Session", "\n".join(lines))
+        light = next((Path(r["path"]) for r in files if Path(r["path"]).suffix.lower() in IMAGING_EXTENSIONS), None)
+        if light and light.is_file():
+            cache = self.catalog.db_path.parent / "thumbnails" / f"{abs(hash(str(light)))}.png"
+            def work():
+                try:
+                    create_thumbnail(light, cache)
+                    def show():
+                        with Image.open(cache) as opened:
+                            pil = opened.copy()
+                        self._thumb_image = ctk.CTkImage(light_image=pil, dark_image=pil, size=pil.size)
+                        self._thumbnail_label.configure(image=self._thumb_image, text="")
+                    self.after(0, show)
+                except Exception as exc:
+                    self.after(0, lambda e=str(exc): self._thumbnail_label.configure(text=f"Thumbnail unavailable: {e}", image=None))
+            threading.Thread(target=work, daemon=True).start()
+
+    def _edit_session(self):
+        selected = self._selected_session()
+        if not selected: return
+        current = self.catalog.session_detail(*selected)["meta"]
+        rating = simpledialog.askinteger("Session rating", "Rating from 0 to 5:", initialvalue=current.get("rating",0), minvalue=0, maxvalue=5, parent=self)
+        if rating is None: return
+        tags = simpledialog.askstring("Session tags", "Comma-separated tags:", initialvalue=current.get("tags",""), parent=self)
+        if tags is None: return
+        notes = simpledialog.askstring("Session notes", "Observing and processing notes:", initialvalue=current.get("notes",""), parent=self)
+        if notes is None: return
+        self.catalog.set_session_meta(*selected, rating, notes, tags)
+        self.catalog.record_session_event(*selected, "notes_updated", f"Rating {rating}/5; tags {tags}")
+        self._open_session()
+
+    def _export_session(self, kind):
+        selected = self._selected_session()
+        if not selected: return
+        suffix = ".csv" if kind == "csv" else ".pdf"
+        path = filedialog.asksaveasfilename(defaultextension=suffix,
+            filetypes=[(kind.upper(), f"*{suffix}")], initialfile=f"session_{selected[0] or 'unknown'}{suffix}")
+        if not path: return
+        if kind == "csv": self.catalog.export_session_csv(*selected, Path(path))
+        else: self.catalog.export_session_pdf(*selected, Path(path))
+        messagebox.showinfo("Session report", f"Saved to:\n{path}")
+
+    def _import_weather(self):
+        path = filedialog.askopenfilename(title="Import weather CSV", filetypes=[("CSV", "*.csv")])
+        if not path: return
+        try: count = self.catalog.import_weather_csv(Path(path))
+        except Exception as exc: messagebox.showerror("Weather import", str(exc)); return
+        messagebox.showinfo("Weather import", f"Imported {count} weather samples.")
+        self._open_session()
+
+    def _analyse_quality(self):
+        if self._quality_batch: return
+        pending = self.catalog.pending_quality_paths()
+        if not pending:
+            messagebox.showinfo("Image quality", "All indexed light frames are already analysed."); return
+        self._quality_batch = QualityBatch()
+        self._status_var.set(f"Analysing {len(pending)} light frames…")
+        def progress(i,n,path,result,eta):
+            self.after(0, lambda: self._status_var.set(
+                f"Image quality {i}/{n} · {result.score:.0f}/100 · ETA {eta:.0f}s · {path.name}"))
+        def work():
+            try: self.catalog.analyse_pending_quality(self._quality_batch, progress)
+            except Exception as exc: self.after(0, lambda e=str(exc): messagebox.showerror("Image quality", e))
+            finally:
+                self._quality_batch = None
+                self.after(0, lambda: (self._status_var.set("Image-quality analysis complete"), self.refresh()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _pause_quality(self):
+        if not self._quality_batch: return
+        if self._quality_batch._pause.is_set():
+            self._quality_batch.resume(); self._status_var.set("Image analysis resumed")
+        else:
+            self._quality_batch.pause(); self._status_var.set("Image analysis paused")
+
+    def _cancel_quality(self):
+        if self._quality_batch:
+            self._quality_batch.cancel(); self._status_var.set("Cancelling image analysis…")
 
     def _cleanup(self):
         rows = self.catalog.cleanup_candidates()
@@ -1580,6 +1825,39 @@ class LibraryFrame(ctk.CTkFrame):
         label = simpledialog.askstring("Storage label", "Name this location:", initialvalue=Path(path).name, parent=self)
         role = simpledialog.askstring("Storage role", "Role (archive, backup, cloud, sd-card):", initialvalue="backup", parent=self)
         if label: self.catalog.add_storage_root(Path(path), label, role or "backup"); self.refresh()
+
+    def _refresh_storage(self):
+        roots = self.catalog.storage_roots()
+        if not roots: return
+        self._status_var.set("Refreshing storage locations in background…")
+        def work():
+            for index, root in enumerate(roots, 1):
+                self.after(0, lambda i=index,n=len(roots),name=root['label']:
+                           self._status_var.set(f"Storage {i}/{n}: {name}"))
+                self.catalog.refresh_storage_root(root["id"])
+            self.after(0, lambda: (self._status_var.set("Storage refresh complete"), self.refresh()))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _backup_database(self):
+        path = filedialog.asksaveasfilename(defaultextension=".sqlite3",
+            filetypes=[("SQLite database", "*.sqlite3")],
+            initialfile=f"asiair_catalog_backup_{datetime.now():%Y%m%d}.sqlite3")
+        if not path: return
+        try: self.catalog.backup_database(Path(path))
+        except Exception as exc: messagebox.showerror("Database backup", str(exc)); return
+        messagebox.showinfo("Database backup", f"Verified SQLite backup saved to:\n{path}")
+
+    def _check_database(self):
+        health = self.catalog.database_health(False)
+        if health["ok"]:
+            messagebox.showinfo("Database health", "Integrity check passed: OK")
+            return
+        if not messagebox.askyesno("Database health", f"Integrity check returned: {health['before']}\n\nBack up and attempt REINDEX/VACUUM repair?"):
+            return
+        backup = self.catalog.db_path.with_name(f"catalog_before_repair_{datetime.now():%Y%m%d_%H%M%S}.sqlite3")
+        self.catalog.backup_database(backup)
+        result = self.catalog.database_health(True)
+        messagebox.showinfo("Database repair", f"Backup: {backup}\nResult: {result['after']}")
 
     def _undo(self):
         audit_id = simpledialog.askinteger("Undo operation", "Audit operation ID to undo:", minvalue=1, parent=self)
@@ -1604,6 +1882,8 @@ class LibraryFrame(ctk.CTkFrame):
 
     def shutdown(self):
         if self._watcher: self._watcher.stop()
+        if self._scan_controller: self._scan_controller.cancel()
+        if self._quality_batch: self._quality_batch.cancel()
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
