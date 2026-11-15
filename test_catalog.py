@@ -108,8 +108,9 @@ class CatalogTests(unittest.TestCase):
         second = self.catalog.scan(backup, "Google Drive", "cloud")
         self.assertGreaterEqual(second.duplicate_groups, 1)
         candidates = self.catalog.cleanup_candidates()
-        self.assertEqual({row["path"] for row in candidates}, {str(raw), str(raw_copy)})
-        self.assertEqual(candidates[0]["master_path"], str(master))
+        self.assertEqual({row["path"] for row in candidates},
+                         {str(raw.resolve()), str(raw_copy.resolve())})
+        self.assertEqual(candidates[0]["master_path"], str(master.resolve()))
 
     def test_cleanup_refuses_without_exact_confirmation(self):
         with self.assertRaises(PermissionError):

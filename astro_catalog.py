@@ -688,7 +688,7 @@ class Catalog:
         deleted, refused, errors = [], [], []
         with self.connect() as conn:
             for raw in paths:
-                path = str(Path(raw))
+                path = str(Path(raw).resolve())
                 if path not in eligible:
                     refused.append(path)
                     continue
