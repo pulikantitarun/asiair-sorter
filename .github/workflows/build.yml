@@ -37,8 +37,8 @@ jobs:
       - name: Stage Windows files
         run: |
           New-Item -ItemType Directory -Force release
-          Copy-Item dist\ASIAIR_Sorter.exe release\ASIAIR_Sorter_Windows_Portable_v3.1.exe
-          Copy-Item installer_output\ASIAIR_Sorter_Setup_v3.1.exe release\ASIAIR_Sorter_Setup_v3.1.exe
+          Copy-Item dist\ASIAIR_Sorter.exe release\ASIAIR_Sorter_Windows_Portable_v3.2.exe
+          Copy-Item installer_output\ASIAIR_Sorter_Setup_v3.2.exe release\ASIAIR_Sorter_Setup_v3.2.exe
           Get-FileHash release\* -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $([IO.Path]::GetFileName($_.Path))" } | Set-Content release\SHA256SUMS-Windows.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -64,13 +64,13 @@ jobs:
             --hidden-import numpy \
             --name ASIAIR_Sorter \
             asiair_sorter.py
-          ditto -c -k --sequesterRsrc --keepParent dist/ASIAIR_Sorter.app ASIAIR_Sorter_macOS_v3.1.zip
-          shasum -a 256 ASIAIR_Sorter_macOS_v3.1.zip > SHA256SUMS-macOS.txt
+          ditto -c -k --sequesterRsrc --keepParent dist/ASIAIR_Sorter.app ASIAIR_Sorter_macOS_v3.2.zip
+          shasum -a 256 ASIAIR_Sorter_macOS_v3.2.zip > SHA256SUMS-macOS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ASIAIR-Sorter-macOS
           path: |
-            ASIAIR_Sorter_macOS_v3.1.zip
+            ASIAIR_Sorter_macOS_v3.2.zip
             SHA256SUMS-macOS.txt
 
   linux:
@@ -96,13 +96,13 @@ jobs:
             --name ASIAIR_Sorter \
             asiair_sorter.py
           chmod +x dist/ASIAIR_Sorter
-          tar -C dist -czf ASIAIR_Sorter_Linux_x86_64_v3.1.tar.gz ASIAIR_Sorter
-          sha256sum ASIAIR_Sorter_Linux_x86_64_v3.1.tar.gz > SHA256SUMS-Linux.txt
+          tar -C dist -czf ASIAIR_Sorter_Linux_x86_64_v3.2.tar.gz ASIAIR_Sorter
+          sha256sum ASIAIR_Sorter_Linux_x86_64_v3.2.tar.gz > SHA256SUMS-Linux.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ASIAIR-Sorter-Linux
           path: |
-            ASIAIR_Sorter_Linux_x86_64_v3.1.tar.gz
+            ASIAIR_Sorter_Linux_x86_64_v3.2.tar.gz
             SHA256SUMS-Linux.txt
 
   release:
@@ -121,11 +121,14 @@ jobs:
         with:
           name: ASIAIR Session Sorter ${{ github.ref_name }}
           body: |
-            ASIAIR Session Sorter 3.1 adds FITS image-quality ranking, cloud,
-            trailing and focus-drift warnings, resumable background analysis,
-            responsive large-library scans, detailed session records and
-            reports, target aliases, weather import and automatic ASIAIR media
-            detection with optional safe eject after verified copying.
+            ASIAIR Session Sorter 3.2 adds a redesigned desktop interface,
+            a zoomable PHD2 timeline with a separate event strip and window RMS,
+            a guide-star target plot, and a Next Session panel that explains
+            what to check first using evidence from the guide log.
+
+            Also includes FITS quality ranking, session reports, target aliases,
+            weather import, database maintenance, and ASIAIR media detection
+            with optional eject after verified copying.
 
             Import is copy-and-verify only. Raw FITS files are never removed
             automatically. Cleanup remains separate and approval-only.

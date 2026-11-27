@@ -18,7 +18,8 @@ def _load_phd2_logic():
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     assignments = {"SESSIONS_ROOT", "PHD2_FOLDER", "_DATE_RE", "PHD2_ERROR_LABELS"}
     functions = {"_number", "parse_phd2_log", "discover_phd2_logs",
-                 "_phd2_log_date", "sync_phd2_logs"}
+                 "_phd2_log_date", "sync_phd2_logs",
+                 "_guide_window_mask", "_guide_window_rms", "_guide_event_groups", "_next_guiding_check"}
     nodes = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -63,6 +64,52 @@ Guiding Ends at 2026-10-02 20:00:04
 
 
 class PHD2LogTests(unittest.TestCase):
+    def test_coaching_prioritizes_frame_errors_over_axis_imbalance(self):
+        run = PHD["PHD2Session"](times=np.arange(400.), ra_err=np.ones(400),
+                                dec_err=np.full(400, .2), error_codes=np.r_[np.ones(12), np.zeros(388)])
+        title, evidence, *_ = PHD["_next_guiding_check"]([run])
+        self.assertIn("guide-star reliability", title)
+        self.assertIn("3.0%", evidence)
+
+    def test_coaching_excludes_logged_settling_from_axis_comparison(self):
+        run = PHD["PHD2Session"](times=np.arange(400.), ra_err=np.r_[np.full(10, 20.), np.full(390, .3)],
+                                dec_err=np.full(400, .3), error_codes=np.zeros(400), settle_spans=[(0, 10)])
+        self.assertIn("Keep your settings", PHD["_next_guiding_check"]([run])[0])
+        run.dec_err = np.full(400, .15)
+        self.assertIn("Check RA first", PHD["_next_guiding_check"]([run])[0])
+
+    def test_coaching_distinguishes_timeout_and_inadequate_baseline(self):
+        run = PHD["PHD2Session"](times=np.arange(5.), ra_err=np.ones(5), dec_err=np.ones(5))
+        self.assertIn("longer baseline", PHD["_next_guiding_check"]([run])[0])
+        run.events.append("INFO: Settling failed: timed out")
+        self.assertIn("after a dither", PHD["_next_guiding_check"]([run])[0])
+
+    def test_window_rms_excludes_bad_and_outside_samples(self):
+        count, rms = PHD["_guide_window_rms"](
+            np.arange(5), np.array([1, 3, 99, np.nan, 100]),
+            np.array([2, 4, 99, 5, 100]),
+            np.array([True, True, False, True, True]), (0, 3))
+        self.assertEqual(count, 2)
+        np.testing.assert_allclose(rms, np.sqrt([5, 10, 15]))
+        self.assertEqual(PHD["_guide_window_rms"](
+            np.arange(1), np.zeros(1), np.zeros(1), np.ones(1, dtype=bool), (2, 4)), (0, None))
+
+    def test_event_groups_keep_edges_and_expand_when_zoomed(self):
+        groups = PHD["_guide_event_groups"]([0, .2, 1, 10, 11], (0, 10), bins=4)
+        self.assertEqual([count for _, count in groups], [3, 1])
+        zoom = PHD["_guide_event_groups"]([0, .2, 1, 10, 11], (0, 1), bins=10)
+        self.assertEqual(zoom, [(0., 1), (.2, 1), (1., 1)])
+
+    def test_records_only_paired_settling_intervals(self):
+        sample = SAMPLE_LOG.replace("2,2.0", "INFO: SETTLING STATE CHANGE, Settling started\n2,2.0")
+        sample = sample.replace("Guiding Ends", "INFO: SETTLING STATE CHANGE, Settling complete\nGuiding Ends")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "PHD2_GuideLog_2026-10-02_200000.txt"
+            path.write_text(sample, encoding="utf-8")
+            self.assertEqual(parse_phd2_log(path)[0].settle_spans, [(1, 2)])
+            path.write_text(sample.replace("INFO: SETTLING STATE CHANGE, Settling complete\n", ""), encoding="utf-8")
+            self.assertEqual(parse_phd2_log(path)[0].settle_spans, [])
+
     def test_parser_extracts_metadata_metrics_pulses_and_events(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "PHD2_GuideLog_2026-10-02_200000.txt"

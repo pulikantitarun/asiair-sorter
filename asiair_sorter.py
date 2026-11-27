@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════╗
-║         ASIAIR Astrophotography Session Sorter  v3.1         ║
+║         ASIAIR Astrophotography Session Sorter  v3.2         ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Usage (from source):
@@ -39,6 +39,8 @@ try:
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     import matplotlib.gridspec as gridspec
+    from matplotlib.widgets import SpanSelector
+    from matplotlib.patches import Circle
     HAS_MPL = True
 except ImportError:
     try:
@@ -47,6 +49,8 @@ except ImportError:
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         import matplotlib.gridspec as gridspec
+        from matplotlib.widgets import SpanSelector
+        from matplotlib.patches import Circle
         HAS_MPL = True
     except Exception:
         HAS_MPL = False
@@ -95,19 +99,20 @@ _LIGHT_CAMERA_RE = re.compile(
     re.IGNORECASE,
 )
 _INVALID_FOLDER_CHARS_RE = re.compile(r'[<>:"/\\|?*]')
-VERSION     = "3.1"
+VERSION     = "3.2"
 
 # ── UI palette ────────────────────────────────────────────────────────────────
-BG_APP     = "#0d1117"
-BG_CARD    = "#1c2333"
-BG_INPUT   = "#161b22"
-BG_LOG     = "#0d1117"
-FG_TEXT    = "#e6edf3"
-FG_MUTED   = "#8b949e"
-BORDER     = "#30363d"
-ACCENT     = "#1f6feb"
-ACCENT_HL  = "#388bfd"
-BTN_MOVE   = "#2d333b"
+BG_APP     = "#14191b"
+BG_CARD    = "#1c2426"
+BG_INPUT   = "#111719"
+BG_LOG     = "#111719"
+FG_TEXT    = "#edf0eb"
+FG_MUTED   = "#a1aeaa"
+BORDER     = "#344145"
+ACCENT     = "#287564"
+ACCENT_HL  = "#328672"
+FG_SIGNAL  = "#a4dfbb"
+BTN_MOVE   = "#2b3639"
 BTN_CANCEL = "#6e2b2b"
 
 _C = {                          # log text tag colours
@@ -124,16 +129,16 @@ _C = {                          # log text tag colours
 }
 
 MC = {                          # matplotlib chart colours
-    "fig":   "#0d1117",
-    "ax":    "#161b22",
-    "grid":  "#21262d",
-    "tick":  "#6e7681",
-    "text":  "#8b949e",
-    "ra":    "#58a6ff",
-    "dec":   "#f78166",
+    "fig":   BG_APP,
+    "ax":    BG_INPUT,
+    "grid":  BORDER,
+    "tick":  FG_MUTED,
+    "text":  FG_MUTED,
+    "ra":    FG_SIGNAL,
+    "dec":   "#f0a187",
     "snr":   "#e3b341",
     "dither":"#30363d",
-    "pause": "#1c2333",
+    "pause": BG_CARD,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -348,6 +353,8 @@ class PHD2Session:
     dec_dir:   list = field(default_factory=list)
     error_codes: list = field(default_factory=list)
     dithers:   list = field(default_factory=list)   # times of dither events (sec)
+    settle_spans: list = field(default_factory=list)
+    _settle_after_frame: Optional[int] = None
 
     def finalise(self):
         if not HAS_MPL: return
@@ -507,6 +514,14 @@ def parse_phd2_log(path: str) -> List[PHD2Session]:
             # ── Session events ────────────────────────────────────────
             if in_data and cur and not line.split(",",1)[0].strip().isdigit():
                 cur.events.append(line)
+                if "settling state change" in lo:
+                    if "settling started" in lo:
+                        cur._settle_after_frame = len(cur.times)
+                    elif "settling complete" in lo or "settling failed" in lo:
+                        first = cur._settle_after_frame
+                        if first is not None and first < len(cur.times):
+                            cur.settle_spans.append((first, len(cur.times)))
+                        cur._settle_after_frame = None
             if in_data and cur and "dither" in lo:
                 if cur.times:
                     cur.dithers.append(cur.times[-1])
@@ -650,6 +665,118 @@ class StatBox(ctk.CTkFrame):
         self._v.configure(text=val, text_color=colour)
 
 
+def _guide_window_mask(times, ra, dec, good, bounds):
+    return (good & np.isfinite(ra) & np.isfinite(dec)
+            & (times >= bounds[0]) & (times <= bounds[1]))
+
+
+def _guide_window_rms(times, ra, dec, good, bounds):
+    valid = _guide_window_mask(times, ra, dec, good, bounds)
+    count = int(np.count_nonzero(valid))
+    if not count:
+        return 0, None
+    ra2, dec2 = np.mean(ra[valid] ** 2), np.mean(dec[valid] ** 2)
+    return count, tuple(np.sqrt([ra2, dec2, ra2 + dec2]))
+
+
+def _guide_event_groups(times, bounds, bins=64):
+    visible = np.asarray(times, dtype=float)
+    visible = visible[(visible >= bounds[0]) & (visible <= bounds[1])]
+    span = bounds[1] - bounds[0]
+    if not visible.size or span <= 0:
+        return []
+    indices = np.minimum((bins * (visible - bounds[0]) / span).astype(int), bins - 1)
+    return [(float(points.mean()), len(points)) for i in np.unique(indices)
+            for points in [visible[indices == i]]]
+
+
+def _next_guiding_check(sessions):
+    """Rank one low-risk check. Thresholds flag patterns, not mount faults."""
+    errors = measured_frames = 0
+    timeout_count = 0
+    valid_time_s = 0.0
+    pairs = []
+    units = {s.units for s in sessions if s.n_frames}
+    for s in sessions:
+        if not s.n_frames:
+            continue
+        codes = np.asarray(s.error_codes)
+        good = np.ones(s.n_frames, dtype=bool)
+        if len(codes) == s.n_frames:
+            good = codes == 0
+            errors += int(np.count_nonzero(~good))
+            measured_frames += s.n_frames
+        for first, stop in s.settle_spans:
+            good[first:stop] = False
+        timeout_count += sum("settl" in line.lower() and
+                             bool(re.search(r"timed\s*out|time[- ]?out", line, re.I))
+                             for line in s.events)
+        ra, dec = np.asarray(s.ra_err), np.asarray(s.dec_err)
+        good &= np.isfinite(ra) & np.isfinite(dec)
+        if np.any(good):
+            pairs.append(np.column_stack((ra[good], dec[good])))
+        if len(s.times) > 1:
+            steps = np.diff(s.times)
+            adjacent = good[:-1] & good[1:] & (steps > 0)
+            if np.any(steps > 0):
+                typical_step = np.median(steps[steps > 0])
+                valid_time_s += float(np.sum(steps[adjacent & (steps <= 3 * typical_step)]))
+    if measured_frames and errors >= 5 and errors / measured_frames >= .01:
+        return (
+            "Check guide-star reliability first",
+            f"{errors:,} of {measured_frames:,} guide frames reported errors ({errors / measured_frames:.1%}).",
+            "Before touching mount settings, inspect guide-camera focus and star SNR. Check the Events tab for "
+            "the recorded reasons and compare the affected times with clouds or obstructions.",
+            "Run a short comparison on the same target with the same guiding settings. Look for fewer frame errors "
+            "and steadier SNR. Only change one thing between runs.",
+        )
+    if timeout_count:
+        return (
+            "Check what happens after a dither",
+            f"The log recorded {timeout_count:,} settling timeout message(s).",
+            "Watch a few dithers in a short test run. Use Graphs to see which axis takes longer to return, "
+            "and check whether capture resumes before it has settled. Don't loosen the timeout as the first fix.",
+            "Compare a few consecutive dithers under similar conditions. Check that guiding settles before "
+            "the next exposure and inspect the first light after each dither for trailing.",
+        )
+    count = sum(len(pair) for pair in pairs)
+    if count < 120 or valid_time_s < 300:
+        return (
+            "Record a longer baseline before tuning",
+            f"Only {count:,} usable samples across {valid_time_s / 60:.1f} minutes of adjacent valid frames.",
+            "Keep your current settings. Record at least five minutes of steady guiding on the next target, "
+            "with no dithers during the baseline segment.",
+            "Load the new guide log and compare Next Session with how round the stars look in your lights.",
+        )
+    if len(units) == 1:
+        ra, dec = np.sqrt(np.mean(np.concatenate(pairs) ** 2, axis=0))
+        unit = "″" if "arcsec" in units else " px"
+        evidence = (f"RA {ra:.2f}{unit}, Dec {dec:.2f}{unit} RMS across {count:,} valid frames. "
+                    f"{errors:,} recorded frame errors; logged settling excluded from RMS.")
+        if max(ra, dec) >= 1.4 * min(ra, dec) and abs(ra - dec) >= .10:
+            axis = "RA" if ra > dec else "Dec"
+            check = ("measure unguided RA movement. Check for cable drag or wind separately" if axis == "RA" else
+                     "measure Dec drift and, if supported by your mount, check for backlash")
+            return (
+                f"Check {axis} first — don't tune both axes",
+                evidence,
+                f"Run PHD2 Guiding Assistant to {check}. This log shows an axis imbalance, not its cause. "
+                "Keep aggressiveness, exposure and other settings unchanged until you have a baseline.",
+                f"Compare {axis} RMS in two similar steady windows and inspect star shape in the lights. "
+                "Keep any change only if the comparison improves.",
+            )
+    else:
+        evidence = f"{count:,} valid frames; axis comparison skipped because the log mixes units."
+    return (
+        "Keep your settings for the next run",
+        evidence,
+        "This log doesn't flag a clear first correction. Check a few full-resolution lights for trailing "
+        "before changing guiding settings; a low RMS alone doesn't tell you how the images turned out.",
+        "Keep the same guiding profile and save a comparable baseline. If the lights show trailing, compare "
+        "their capture times with Graphs and Star Plot before changing one thing.",
+    )
+
+
 class PHD2ViewerFrame(ctk.CTkFrame):
     def __init__(self, parent, catalog=None):
         super().__init__(parent, fg_color="transparent")
@@ -660,6 +787,8 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         self._auto_sync_var = tk.BooleanVar(value=True)
         self._fig = self._canvas = self._toolbar = None
         self._ax_err = self._ax_snr = None
+        self._guide_data = None
+        self._range_select = None
         self._build_ui()
         self.after(250, self._initialise_library)
         self.after(60000, self._auto_sync_tick)
@@ -727,11 +856,15 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         self._info_lbl.pack(fill="x", padx=6, pady=(0,4))
 
         # Graph, complete details, and raw event views
-        detail_tabs = ctk.CTkTabview(self, fg_color=BG_CARD,
+        detail_tabs = ctk.CTkTabview(self, fg_color=BG_CARD, command=self._guiding_tab_changed,
                                      segmented_button_fg_color=BG_INPUT,
                                      segmented_button_selected_color=ACCENT)
         detail_tabs.pack(fill="both", expand=True)
-        detail_tabs.add("Graphs"); detail_tabs.add("Details"); detail_tabs.add("Events")
+        self._guiding_tabs = detail_tabs
+        detail_tabs.add("Graphs"); detail_tabs.add("Star Plot")
+        detail_tabs.add("Next Session")
+        detail_tabs.add("Details"); detail_tabs.add("Events")
+        self._build_next_session(detail_tabs.tab("Next Session"))
         self._graph_card = ctk.CTkFrame(detail_tabs.tab("Graphs"), fg_color=BG_CARD,
                                         corner_radius=10)
         self._graph_card.pack(fill="both", expand=True)
@@ -744,7 +877,9 @@ class PHD2ViewerFrame(ctk.CTkFrame):
 
         if HAS_MPL:
             self._init_figure()
+            self._init_star_plot(detail_tabs.tab("Star Plot"))
         else:
+            ctk.CTkLabel(detail_tabs.tab("Star Plot"), text="Star Plot requires Matplotlib.").pack(pady=20)
             ctk.CTkLabel(
                 self._graph_card,
                 text="Install matplotlib to enable PHD2 graphs:\n\n"
@@ -752,13 +887,41 @@ class PHD2ViewerFrame(ctk.CTkFrame):
                 font=ctk.CTkFont(size=13), text_color=FG_MUTED,
             ).place(relx=0.5, rely=0.5, anchor="center")
 
+    def _build_next_session(self, tab):
+        body = ctk.CTkScrollableFrame(tab, fg_color=BG_INPUT, corner_radius=8)
+        body.pack(fill="both", expand=True, padx=6, pady=5)
+        self._next_labels = []
+        for index, heading in enumerate(("START HERE", "WHY THIS CHECK", "WHAT TO DO", "HOW TO TELL IF IT HELPED")):
+            ctk.CTkLabel(body, text=heading, text_color=FG_SIGNAL, anchor="w",
+                         font=ctk.CTkFont(size=11, weight="bold")).pack(fill="x", padx=14, pady=(9,0))
+            label = ctk.CTkLabel(body, anchor="w", justify="left", wraplength=710,
+                                 font=ctk.CTkFont(size=19 if index == 0 else 13,
+                                                 weight="bold" if index == 0 else "normal"))
+            label.pack(fill="x", padx=14, pady=(0,5))
+            self._next_labels.append(label)
+        self._next_labels[0].configure(text="Load a PHD2 guide log to get a recommendation.")
+        for label in self._next_labels[1:]:
+            label.configure(text="—")
+
     def _init_figure(self):
-        self._fig = Figure(dpi=96)
+        controls = ctk.CTkFrame(self._graph_card, fg_color="transparent")
+        controls.pack(fill="x", padx=7, pady=(3,0))
+        for label, minutes in (("Full night", None), ("10 min", 10), ("2 min", 2)):
+            ctk.CTkButton(controls, text=label, width=72, height=25,
+                          command=lambda m=minutes: self._zoom_guiding(m)).pack(side="left", padx=(0,4))
+        ctk.CTkLabel(controls, text="Drag the overview to select a range",
+                     text_color=FG_MUTED, font=ctk.CTkFont(size=11)).pack(side="right")
+        self._window_stats = ctk.CTkLabel(self._graph_card, text="Window RMS · Load a guide log",
+                                           text_color=FG_SIGNAL, anchor="w", font=ctk.CTkFont(size=11))
+        self._window_stats.pack(fill="x", padx=9)
+        self._fig = Figure(dpi=96, layout="constrained")
         self._fig.patch.set_facecolor(MC["fig"])
-        gs = gridspec.GridSpec(2, 1, figure=self._fig,
-                               height_ratios=[2.8, 1], hspace=0.06)
+        gs = gridspec.GridSpec(4, 1, figure=self._fig,
+                               height_ratios=[3.2, 1.15, .65, .60], hspace=0.04)
         self._ax_err = self._fig.add_subplot(gs[0])
         self._ax_snr = self._fig.add_subplot(gs[1], sharex=self._ax_err)
+        self._ax_events = self._fig.add_subplot(gs[2], sharex=self._ax_err)
+        self._ax_overview = self._fig.add_subplot(gs[3])
 
         _style_ax(self._ax_err, ylabel="Guide Error (arcsec)")
         _style_ax(self._ax_snr, ylabel="Star SNR")
@@ -771,15 +934,16 @@ class PHD2ViewerFrame(ctk.CTkFrame):
                     color=FG_MUTED, fontsize=11)
 
         self._canvas = FigureCanvasTkAgg(self._fig, master=self._graph_card)
+        self._canvas.mpl_connect("button_press_event", self._guide_event_click)
 
         # Toolbar with basic dark styling
-        tb_frame = tk.Frame(self._graph_card, bg="#161b22", bd=0)
+        tb_frame = tk.Frame(self._graph_card, bg=BG_INPUT, bd=0)
         tb_frame.pack(side="bottom", fill="x")
         self._toolbar = NavigationToolbar2Tk(self._canvas, tb_frame, pack_toolbar=False)
-        self._toolbar.config(bg="#161b22")
+        self._toolbar.config(bg=BG_INPUT)
         for ch in self._toolbar.winfo_children():
-            try: ch.config(bg="#161b22", fg=FG_TEXT,
-                           highlightbackground="#161b22",
+            try: ch.config(bg=BG_INPUT, fg=FG_TEXT,
+                           highlightbackground=BG_INPUT,
                            activebackground=BORDER, activeforeground=FG_TEXT)
             except Exception: pass
         self._toolbar.update()
@@ -787,6 +951,74 @@ class PHD2ViewerFrame(ctk.CTkFrame):
 
         self._canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=(6,0))
         self._canvas.draw()
+
+    def _init_star_plot(self, tab):
+        toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        toolbar.pack(fill="x", padx=9)
+        ctk.CTkLabel(toolbar, text="Guide star around the lock point",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        ctk.CTkButton(toolbar, text="Full night", width=82, height=25,
+                      command=lambda: self._zoom_guiding(None)).pack(side="right")
+        self._star_summary = ctk.CTkLabel(tab, text="Load a guide log to see the star plot.",
+                                          anchor="w", text_color=FG_MUTED, font=ctk.CTkFont(size=11))
+        self._star_summary.pack(fill="x", padx=9)
+        self._star_fig = Figure(dpi=96, layout="constrained", facecolor=BG_APP)
+        self._star_ax = self._star_fig.add_subplot()
+        self._star_canvas = FigureCanvasTkAgg(self._star_fig, master=tab)
+        self._star_canvas.get_tk_widget().pack(fill="both", expand=True, padx=6, pady=(4,6))
+        self._draw_star_plot()
+
+    def _guiding_tab_changed(self):
+        if HAS_MPL and self._guiding_tabs.get() == "Star Plot":
+            self._draw_star_plot()
+
+    def _draw_star_plot(self):
+        ax = self._star_ax
+        ax.clear()
+        _style_ax(ax, ylabel="")
+        ax.set_aspect("equal", adjustable="box")
+        message = "Load a guide log to see the star plot."
+        if self._guide_data is not None:
+            times, ra, dec, good, units, _ = self._guide_data
+            bounds = tuple(sorted(self._ax_err.get_xlim()))
+            selected = _guide_window_mask(times, ra, dec, good, bounds)
+            if units == "mixed units":
+                message = "Star plot unavailable: this log mixes arcseconds and pixels."
+            elif not np.any(selected):
+                message = "No valid guide positions in the selected time range."
+            else:
+                x, y = ra[selected], dec[selected]
+                radius95 = float(np.percentile(np.hypot(x, y), 95))
+                limit = max(float(np.max(np.abs(x))), float(np.max(np.abs(y))), .1) * 1.10
+                ax.set_xlim(-limit, limit)
+                ax.set_ylim(-limit, limit)
+                ax.grid(False)
+                ax.axhline(0, color=BORDER, lw=.85)
+                ax.axvline(0, color=BORDER, lw=.85)
+                for radius in (.25 * limit, .5 * limit, .75 * limit, limit):
+                    ax.add_patch(Circle((0, 0), radius, fill=False, edgecolor=BORDER, lw=.8))
+                if radius95 > 0:
+                    ax.add_patch(Circle((0, 0), radius95, fill=False, edgecolor=FG_SIGNAL,
+                                        lw=1, ls="--", alpha=.80))
+                ax.scatter(x, y, s=6 if len(x) < 2500 else 3, c=FG_SIGNAL,
+                           alpha=.45 if len(x) < 2500 else .22, linewidths=0)
+                ax.scatter(x[-1], y[-1], marker="x", s=48, c=MC["dec"], linewidths=1.5,
+                           label="Last valid sample", zorder=4)
+                ax.legend(loc="upper right", fontsize=8, facecolor=BG_CARD,
+                          edgecolor=BORDER, labelcolor=FG_TEXT)
+                unit = "″" if units == "arcsec" else " px"
+                ax.set_xlabel(f"RA offset ({units})", fontsize=9, color=FG_MUTED)
+                ax.set_ylabel(f"Dec offset ({units})", fontsize=9, color=FG_MUTED)
+                message = (f"{len(x):,} samples  /  {bounds[0]:.1f}–{bounds[1]:.1f} min"
+                           f"  /  95% within {radius95:.2f}{unit}"
+                           "  /  logged settling excluded")
+                self._star_summary.configure(text=message)
+                self._star_canvas.draw_idle()
+                return
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(.5, .5, message, ha="center", va="center", transform=ax.transAxes, color=FG_MUTED)
+        self._star_summary.configure(text=message)
+        self._star_canvas.draw_idle()
 
     # ── Actions ────────────────────────────────────────────────────────────
 
@@ -882,6 +1114,8 @@ class PHD2ViewerFrame(ctk.CTkFrame):
             self._sb["Quality"].set(f"{score:.0f}/100", colour)
         if HAS_MPL:
             self._draw_graphs(sessions)
+        for label, value in zip(self._next_labels, _next_guiding_check(sessions)):
+            label.configure(text=value)
 
     # ── Stats ──────────────────────────────────────────────────────────────
 
@@ -995,13 +1229,24 @@ class PHD2ViewerFrame(ctk.CTkFrame):
 
     def _draw_graphs(self, sessions: List[PHD2Session]):
         ax_err, ax_snr = self._ax_err, self._ax_snr
-        ax_err.cla(); ax_snr.cla()
+        self._guide_data = None
+        if self._range_select:
+            self._range_select.disconnect_events()
+        for axis in (ax_err, ax_snr, self._ax_events, self._ax_overview):
+            axis.clear()
 
-        units = sessions[0].units
-        _style_ax(ax_err, ylabel=f"Guide Error ({units})")
-        _style_ax(ax_snr, ylabel="Star SNR")
-        ax_snr.set_xlabel("Time (minutes)", color=MC["text"], fontsize=9)
+        units = sessions[0].units if len({s.units for s in sessions}) == 1 else "mixed units"
+        _style_ax(ax_err, ylabel="″" if units == "arcsec" else units)
+        _style_ax(ax_snr, ylabel="")
         ax_err.tick_params(labelbottom=False)
+        ax_snr.tick_params(labelbottom=False)
+        _style_ax(self._ax_events, ylabel="")
+        self._ax_events.set_yticks([0, 1], ["Dither", "Frame error"], fontsize=8)
+        self._ax_events.set_ylim(-.5, 1.5)
+        _style_ax(self._ax_overview, ylabel="")
+        self._ax_overview.set_yticks([0], ["Full night"], fontsize=8)
+        self._ax_overview.set_xlabel("Run timeline (minutes; breaks shown as 3 min)",
+                                     color=MC["text"], fontsize=8)
 
         GAP_MIN = 3.0   # gap between sessions (minutes)
         t_offset = 0.0
@@ -1012,6 +1257,8 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         all_snr_t= []
         all_snr  = []
         dither_t = []   # dither event times (in plot minutes)
+        lost_t = []
+        good_frames = []
 
         for i, s in enumerate(sessions):
             if s.n_frames == 0: continue
@@ -1022,6 +1269,17 @@ class PHD2ViewerFrame(ctk.CTkFrame):
             all_t.extend(t_min)
             all_ra.extend(s.ra_err)
             all_dec.extend(s.dec_err)
+            good = np.ones(len(t_min), dtype=bool)
+            if len(s.error_codes) == len(t_min):
+                codes = np.asarray(s.error_codes)
+                good = codes == 0
+                lost_t.extend(t_min[codes != 0])
+            for first, past_last in s.settle_spans:
+                good[first:past_last] = False
+                if past_last - first > 1:
+                    self._ax_events.axvspan(t_min[first], t_min[past_last - 1],
+                                           color=ACCENT, alpha=.28)
+            good_frames.extend(good)
 
             # Dither markers
             for dt in s.dithers:
@@ -1030,7 +1288,7 @@ class PHD2ViewerFrame(ctk.CTkFrame):
 
             # SNR (may have fewer points if some frames dropped)
             if len(s.snr):
-                snr_t = np.linspace(t_min[0], t_min[-1], len(s.snr))
+                snr_t = t_min if len(s.snr) == len(t_min) else np.linspace(t_min[0], t_min[-1], len(s.snr))
                 all_snr_t.extend(snr_t)
                 all_snr.extend(s.snr)
 
@@ -1041,10 +1299,11 @@ class PHD2ViewerFrame(ctk.CTkFrame):
                 pause_end = t_end + GAP_MIN
                 all_t.append(t_end + GAP_MIN/2);  all_ra.append(float("nan"))
                 all_dec.append(float("nan"))
+                good_frames.append(False)
                 if all_snr:
                     all_snr_t.append(t_end + GAP_MIN/2); all_snr.append(float("nan"))
                 # Shade the gap
-                for ax in (ax_err, ax_snr):
+                for ax in (ax_err, ax_snr, self._ax_events, self._ax_overview):
                     ax.axvspan(t_end, pause_end, color=MC["pause"], alpha=0.6,
                                label="_nolegend_")
                 t_offset = pause_end
@@ -1054,34 +1313,13 @@ class PHD2ViewerFrame(ctk.CTkFrame):
         all_t   = np.array(all_t,   dtype=float)
         all_ra  = np.array(all_ra,  dtype=float)
         all_dec = np.array(all_dec, dtype=float)
-        valid   = ~np.isnan(all_ra)
-
-        # Compute aggregate RMS from valid frames only
-        rms_ra  = float(np.sqrt(np.mean(all_ra[valid]**2)))
-        rms_dec = float(np.sqrt(np.mean(all_dec[valid]**2)))
-        u = '"' if units == "arcsec" else " px"
-
-        # ── Error plot ───────────────────────────────────────────────
         ax_err.plot(all_t, all_ra,  color=MC["ra"],  lw=0.85, alpha=0.85,
-                    label=f"RA  RMS={rms_ra:.2f}{u}")
+                    label="RA")
         ax_err.plot(all_t, all_dec, color=MC["dec"], lw=0.85, alpha=0.85,
-                    label=f"Dec RMS={rms_dec:.2f}{u}")
+                    label="Dec")
 
-        # ±RMS reference bands
-        for rms, colour in [(rms_ra, MC["ra"]), (-rms_ra, MC["ra"]),
-                             (rms_dec, MC["dec"]), (-rms_dec, MC["dec"])]:
-            ax_err.axhline(rms, color=colour, lw=0.8, ls="--", alpha=0.40)
         ax_err.axhline(0, color=BORDER, lw=0.9)
-
-        # Dither markers
-        for dt in dither_t:
-            ax_err.axvline(dt, color=MC["dither"], lw=1.2, ls=":", alpha=0.7)
-        if dither_t:
-            # Dummy line for legend entry
-            ax_err.axvline(dither_t[0], color=MC["dither"], lw=1.2, ls=":",
-                           alpha=0.7, label=f"Dither ×{len(dither_t)}")
-
-        leg = ax_err.legend(facecolor="#1c2333", edgecolor=BORDER,
+        ax_err.legend(facecolor=BG_CARD, edgecolor=BORDER,
                              fontsize=9, labelcolor=FG_TEXT, loc="upper right")
 
         # ── SNR plot ─────────────────────────────────────────────────
@@ -1089,15 +1327,83 @@ class PHD2ViewerFrame(ctk.CTkFrame):
             ax_snr.plot(np.array(all_snr_t, dtype=float),
                         np.array(all_snr,   dtype=float),
                         color=MC["snr"], lw=0.85, alpha=0.85, label="Star SNR")
-            ax_snr.legend(facecolor="#1c2333", edgecolor=BORDER,
+            ax_snr.legend(facecolor=BG_CARD, edgecolor=BORDER,
                            fontsize=9, labelcolor=FG_TEXT, loc="upper right")
         else:
             ax_snr.text(0.5, 0.5, "No SNR data in this log",
                         transform=ax_snr.transAxes, ha="center", va="center",
                         color=FG_MUTED, fontsize=10)
 
-        self._fig.tight_layout(pad=1.0)
-        self._canvas.draw()
+        self._ax_overview.plot(all_t, np.hypot(all_ra, all_dec), color=FG_SIGNAL, lw=.6)
+        bounds = (float(all_t[0]), max(float(all_t[-1]), float(all_t[0]) + 1 / 60))
+        self._ax_overview.set_xlim(*bounds)
+        self._guide_data = all_t, all_ra, all_dec, np.asarray(good_frames), units, bounds
+        self._guide_events = (dither_t, lost_t)
+        self._event_marks = [
+            self._ax_events.scatter([], [], marker="|", color=MC["snr"]),
+            self._ax_events.scatter([], [], marker="x", color=MC["dec"]),
+        ]
+        self._guide_span = self._ax_overview.axvspan(*bounds, color=ACCENT, alpha=.26)
+        self._range_select = SpanSelector(
+            self._ax_overview, self._select_guiding, "horizontal", minspan=1 / 600,
+            props={"facecolor": FG_SIGNAL, "alpha": .22}, useblit=False)
+        ax_err.callbacks.connect("xlim_changed", self._guide_window_changed)
+        self._select_guiding(*bounds)
+
+    def _select_guiding(self, left, right):
+        if self._guide_data and left < right:
+            self._ax_err.set_xlim(left, right)
+            self._canvas.draw_idle()
+
+    def _zoom_guiding(self, minutes, center=None):
+        if self._guide_data is None:
+            return
+        start, end = self._guide_data[-1]
+        if minutes is None or end - start <= minutes:
+            self._select_guiding(start, end)
+            return
+        if center is None:
+            center = start + minutes / 2 if np.allclose(self._ax_err.get_xlim(), (start, end)) else np.mean(self._ax_err.get_xlim())
+        left = min(max(start, center - minutes / 2), end - minutes)
+        self._select_guiding(left, left + minutes)
+
+    def _guide_event_click(self, event):
+        if (self._guide_data is None or event.inaxes is not self._ax_events
+                or event.xdata is None or event.ydata is None
+                or event.button != 1 or self._toolbar.mode):
+            return
+        row = int(round(event.ydata))
+        if row not in (0, 1):
+            return
+        bounds = self._ax_err.get_xlim()
+        groups = _guide_event_groups(self._guide_events[row], bounds)
+        if groups:
+            nearest, _ = min(groups, key=lambda g: abs(g[0] - event.xdata))
+            if abs(nearest - event.xdata) <= (bounds[1] - bounds[0]) / 42:
+                self._zoom_guiding(2, center=nearest)
+
+    def _guide_window_changed(self, axis):
+        times, ra, dec, good, units, full = self._guide_data
+        bounds = tuple(sorted(axis.get_xlim()))
+        count, rms = _guide_window_rms(times, ra, dec, good, bounds)
+        if units == "mixed units":
+            label = "Window RMS unavailable: this log mixes arcseconds and pixels"
+        elif rms is None:
+            label = "Window RMS · No valid frames in this range"
+        else:
+            unit = "″" if units == "arcsec" else " px"
+            label = (f"Window RMS  ·  RA {rms[0]:.2f}{unit}   Dec {rms[1]:.2f}{unit}   "
+                     f"Total {rms[2]:.2f}{unit}   /   {count:,} frames; logged settling excluded")
+        self._window_stats.configure(text=label)
+        for row, (events, marks) in enumerate(zip(self._guide_events, self._event_marks)):
+            groups = _guide_event_groups(events, bounds)
+            marks.set_offsets(np.asarray([(t, row) for t, _ in groups]).reshape(-1, 2))
+            marks.set_sizes([min(100, 18 + 7 * n) for _, n in groups])
+        self._guide_span.remove()
+        left, right = max(full[0], bounds[0]), min(full[1], bounds[1])
+        self._guide_span = self._ax_overview.axvspan(left, max(left, right), color=ACCENT, alpha=.26)
+        if self._guiding_tabs.get() == "Star Plot":
+            self._draw_star_plot()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1105,14 +1411,19 @@ class PHD2ViewerFrame(ctk.CTkFrame):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class FolderCard(ctk.CTkFrame):
-    def __init__(self, parent, label: str, var: tk.StringVar, **kw):
-        super().__init__(parent, fg_color=BG_CARD, corner_radius=10, **kw)
+    def __init__(self, parent, label: str, var: tk.StringVar, *, index, detail, **kw):
+        super().__init__(parent, fg_color=BG_CARD, corner_radius=8,
+                         border_width=1, border_color=BORDER, **kw)
         lf = ctk.CTkFrame(self, fg_color="transparent")
         lf.pack(fill="x", padx=16, pady=(12,4))
-        ctk.CTkLabel(lf, text=label, font=ctk.CTkFont(size=12, weight="bold"),
+        ctk.CTkLabel(lf, text=index, text_color=FG_SIGNAL, width=28,
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0,7))
+        ctk.CTkLabel(lf, text=label, font=ctk.CTkFont(size=14, weight="bold"),
                      text_color=FG_TEXT).pack(side="left")
+        ctk.CTkLabel(self, text=detail, text_color=FG_MUTED, anchor="w",
+                     font=ctk.CTkFont(size=12)).pack(fill="x", padx=16)
         row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=16, pady=(0,12))
+        row.pack(fill="x", padx=16, pady=(6,14))
         row.columnconfigure(0, weight=1)
         ctk.CTkEntry(row, textvariable=var,
                      placeholder_text="Click Browse… to select a folder",
@@ -1147,15 +1458,18 @@ class SortFrame(ctk.CTkFrame):
         self.after(800, self._detect_sources)
 
     def _build_ui(self):
-        FolderCard(self, "⬤  SD Card / Asiair Source Folder",
-                   self.src_var).pack(fill="x", pady=(0,8))
-        FolderCard(self, "⬤  Destination Storage Folder",
-                   self.dst_var).pack(fill="x", pady=(0,10))
+        folders = ctk.CTkFrame(self, fg_color="transparent")
+        folders.pack(fill="x", pady=(0,14))
+        folders.columnconfigure((0, 1), weight=1, uniform="import")
+        FolderCard(folders, "Capture source", self.src_var, index="01",
+                   detail="ASIAIR SD card or capture folder").grid(row=0, column=0, sticky="ew", padx=(0,6))
+        FolderCard(folders, "Archive destination", self.dst_var, index="02",
+                   detail="PC or mounted storage folder").grid(row=0, column=1, sticky="ew", padx=(6,0))
 
         # Options + buttons
         ctrl = ctk.CTkFrame(self, fg_color="transparent")
         ctrl.pack(fill="x", pady=(0,10))
-        ctk.CTkCheckBox(ctrl, text="Dry Run  —  preview only, no files touched",
+        ctk.CTkCheckBox(ctrl, text="Dry run only",
                         variable=self.dry_var,
                         font=ctk.CTkFont(size=12), text_color=FG_TEXT,
                         checkmark_color="#ffffff", border_color=BORDER,
@@ -1164,7 +1478,7 @@ class SortFrame(ctk.CTkFrame):
                         variable=self.eject_var, font=ctk.CTkFont(size=11),
                         text_color=FG_MUTED, border_color=BORDER).pack(side="left", padx=(0,12))
         self.cancel_btn = ctk.CTkButton(
-            ctrl, text="■  Cancel", width=110, height=36,
+            ctrl, text="Cancel", width=80, height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=BTN_CANCEL, hover_color="#8b3a3a",
             state="disabled", command=self._cancel)
@@ -1177,7 +1491,7 @@ class SortFrame(ctk.CTkFrame):
             command=self._start_preview)
         self.move_btn.pack(side="right", padx=(6,0))
         self.copy_btn = ctk.CTkButton(
-            ctrl, text="▶  Copy + Verify", width=140, height=36,
+            ctrl, text="Copy and verify", width=140, height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HL,
             command=lambda: self._start("copy"))
@@ -1188,8 +1502,8 @@ class SortFrame(ctk.CTkFrame):
         prog_card.pack(fill="x", pady=(0,10))
         pi = ctk.CTkFrame(prog_card, fg_color="transparent")
         pi.pack(fill="x", padx=16, pady=10)
-        self.prog_bar = ctk.CTkProgressBar(pi, height=14, corner_radius=7,
-                                            fg_color="#21262d",
+        self.prog_bar = ctk.CTkProgressBar(pi, height=5, corner_radius=3,
+                                            fg_color=BORDER,
                                             progress_color=ACCENT)
         self.prog_bar.set(0); self.prog_bar.pack(fill="x")
         sr = ctk.CTkFrame(pi, fg_color="transparent")
@@ -1208,8 +1522,8 @@ class SortFrame(ctk.CTkFrame):
         log_card.pack(fill="both", expand=True)
         lh = ctk.CTkFrame(log_card, fg_color="transparent")
         lh.pack(fill="x", padx=16, pady=(10,6))
-        ctk.CTkLabel(lh, text="Output Log",
-                     font=ctk.CTkFont(size=12, weight="bold"),
+        ctk.CTkLabel(lh, text="Transfer activity",
+                     font=ctk.CTkFont(size=14, weight="bold"),
                      text_color=FG_TEXT).pack(side="left")
         ctk.CTkButton(lh, text="Clear", width=60, height=24,
                       font=ctk.CTkFont(size=11),
@@ -1472,12 +1786,11 @@ class LibraryFrame(ctk.CTkFrame):
     def _build_ui(self):
         bar = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=10)
         bar.pack(fill="x", pady=(0,8))
-        ctk.CTkLabel(bar, text="Astrophotography Library",
-                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=14, pady=10)
-        ctk.CTkLabel(bar, textvariable=self._status_var, text_color=FG_MUTED,
-                     font=ctk.CTkFont(size=10)).pack(side="left", padx=8)
+        ctk.CTkLabel(bar, textvariable=self._status_var, text_color=FG_MUTED, anchor="w",
+                     font=ctk.CTkFont(size=12)).pack(side="left", padx=12, fill="x", expand=True, anchor="w")
         ctk.CTkButton(bar, text="Scan Folder…", width=100, command=self._choose_scan).pack(side="right", padx=(4,12), pady=8)
         ctk.CTkButton(bar, text="Scan Destination", width=120,
+                      fg_color=ACCENT, hover_color=ACCENT_HL,
                       command=self.scan_configured).pack(side="right", padx=4, pady=8)
         ctk.CTkButton(bar, text="Refresh", width=70, command=self.refresh).pack(side="right", padx=4, pady=8)
         ctk.CTkButton(bar, text="Cancel", width=60, fg_color=BTN_CANCEL,
@@ -1497,6 +1810,9 @@ class LibraryFrame(ctk.CTkFrame):
                      "Cleanup", "Duplicates", "Storage", "Audit"):
             self.tabs.add(name)
             tab = self.tabs.tab(name)
+            if name == "Overview":
+                self._build_overview(tab)
+                continue
             controls = ctk.CTkFrame(tab, fg_color="transparent")
             controls.pack(fill="x", padx=4, pady=(4,0))
             if name == "Targets":
@@ -1556,6 +1872,30 @@ class LibraryFrame(ctk.CTkFrame):
             box.pack(fill="both", expand=True, padx=4, pady=4)
             self._boxes[name] = box
 
+    def _build_overview(self, tab):
+        metrics = ctk.CTkFrame(tab, fg_color="transparent")
+        metrics.pack(fill="x", padx=12, pady=(10,12))
+        metrics.columnconfigure(tuple(range(4)), weight=1, uniform="metric")
+        self._metrics = {}
+        for i, (key, title) in enumerate((("files", "Indexed files"), ("sessions", "Sessions"),
+                                           ("masters", "Verified masters"), ("bytes", "Archive size"))):
+            card = ctk.CTkFrame(metrics, fg_color=BG_INPUT, corner_radius=7)
+            card.grid(row=0, column=i, sticky="ew", padx=(0,8) if i < 3 else 0)
+            value = ctk.CTkLabel(card, text="—", text_color=FG_SIGNAL, anchor="w",
+                                 font=ctk.CTkFont(size=25, weight="bold"))
+            value.pack(fill="x", padx=13, pady=(10,0))
+            ctk.CTkLabel(card, text=title, anchor="w", text_color=FG_MUTED,
+                         font=ctk.CTkFont(size=12)).pack(fill="x", padx=13, pady=(0,9))
+            self._metrics[key] = value
+        self._overview_note = ctk.CTkLabel(tab, text="", text_color=FG_MUTED, anchor="w",
+                                            wraplength=650, justify="left")
+        self._overview_note.pack(fill="x", padx=13, pady=(0,10))
+        ctk.CTkLabel(tab, text="Recent guiding runs", font=ctk.CTkFont(size=16, weight="bold"),
+                     anchor="w").pack(fill="x", padx=13)
+        box = ctk.CTkTextbox(tab, fg_color=BG_LOG, text_color=FG_TEXT, font=("Consolas", 11), wrap="none")
+        box.pack(fill="both", expand=True, padx=12, pady=(6,10))
+        self._boxes["Overview"] = box
+
     def _write(self, name, text):
         box = self._boxes[name]
         box.configure(state="normal"); box.delete("1.0", "end")
@@ -1565,20 +1905,16 @@ class LibraryFrame(ctk.CTkFrame):
         d = self.catalog.dashboard()
         roots = self.catalog.storage_roots()
         quality = self.catalog.phd2_quality_rows()
-        overview = [
-            "LIBRARY OVERVIEW", "="*72,
-            f"Indexed files       {d['files']:,}", f"Indexed size        {_human_bytes(d['bytes'])}",
-            f"Sessions            {d['sessions']:,}", f"Targets             {d['targets'] or 0}",
-            f"Verified masters    {d['masters'] or 0}",
-            f"Duplicate groups    {d['duplicate_groups']:,}  ({_human_bytes(d['duplicate_bytes'])} reclaimable)",
-            f"Safe cleanup queue  {d['cleanup_files']:,}  ({_human_bytes(d['cleanup_bytes'])})",
-            f"Storage locations   {len(roots)}", f"PHD2 scores         {len(quality)}",
-        ]
-        if quality:
-            overview += ["", "RECENT GUIDING QUALITY"] + [
-                f"{r.get('capture_date') or 'Unknown':<12} {r['score']:>5.1f}/100  RMS {r['rms_total']:.3f}  {Path(r['path']).name}"
-                for r in quality[:10]]
-        self._write("Overview", "\n".join(overview))
+        for key, label in self._metrics.items():
+            label.configure(text=_human_bytes(d[key]) if key == "bytes" else f"{d[key] or 0:,}")
+        self._overview_note.configure(text=(
+            f"{d['targets'] or 0} targets  /  {len(roots)} storage locations  /  "
+            f"{d['duplicate_groups']:,} duplicate groups ({_human_bytes(d['duplicate_bytes'])})  /  "
+            f"{d['cleanup_files']:,} eligible raw copies ({_human_bytes(d['cleanup_bytes'])})"
+            if d["files"] else "No files indexed yet. Scan your archive destination or choose an existing folder."))
+        self._write("Overview", "\n".join(
+            f"{r.get('capture_date') or 'Unknown':<12}  {r['score']:>5.1f}/100  RMS {r['rms_total']:.3f}  {Path(r['path']).name}"
+            for r in quality[:10]) or "No PHD2 runs indexed. Open PHD2 Guiding to sync or browse for a log.")
 
         self._write("Sessions", "\n".join(
             f"{r['capture_date'] or 'Unknown':<12}  {(r['camera'] or 'Unknown'):<18}  {(r['target'] or 'Unknown'):<24} "
@@ -1887,6 +2223,12 @@ class LibraryFrame(ctk.CTkFrame):
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+ctk.ThemeManager.theme["CTkButton"].update(
+    fg_color=BTN_MOVE, hover_color=BORDER, text_color=FG_TEXT, corner_radius=6)
+ctk.ThemeManager.theme["CTkCheckBox"].update(fg_color=ACCENT, hover_color=ACCENT_HL)
+ctk.ThemeManager.theme["CTkSegmentedButton"].update(
+    selected_hover_color=ACCENT_HL, unselected_color=BG_INPUT,
+    unselected_hover_color=BTN_MOVE, text_color=FG_TEXT)
 
 
 class App(ctk.CTk):
@@ -1894,51 +2236,72 @@ class App(ctk.CTk):
         super().__init__()
         self.catalog = Catalog()
         self.title("ASIAIR Session Sorter")
-        self.geometry("1200x800")
-        self.minsize(1000, 650)
+        self.geometry("1240x800")
+        self.minsize(1060, 650)
         self.configure(fg_color=BG_APP)
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
 
     def _build_ui(self):
-        # ── Header ────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(self, fg_color=BG_CARD, corner_radius=0, height=58)
-        hdr.pack(fill="x"); hdr.pack_propagate(False)
-        inner = ctk.CTkFrame(hdr, fg_color="transparent")
-        inner.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(inner, text="✦  ASIAIR Session Sorter",
-                     font=ctk.CTkFont(size=17, weight="bold"),
-                     text_color=FG_TEXT).pack(side="left", padx=(0,10))
-        ctk.CTkLabel(inner, text=f"v{VERSION}",
-                     font=ctk.CTkFont(size=11),
-                     text_color=FG_MUTED).pack(side="left", pady=(4,0))
-        ctk.CTkFrame(self, fg_color=ACCENT, height=2,
-                     corner_radius=0).pack(fill="x")
+        rail = ctk.CTkFrame(self, fg_color=BG_INPUT, width=156, corner_radius=0)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        ctk.CTkFrame(self, width=1, fg_color=BORDER, corner_radius=0).pack(side="left", fill="y")
+        mark = tk.Canvas(rail, width=32, height=32, bg=BG_INPUT, highlightthickness=0)
+        mark.pack(anchor="w", padx=17, pady=(22,4))
+        mark.create_oval(5, 5, 27, 27, outline=FG_SIGNAL)
+        mark.create_line(16, 0, 16, 11, fill=FG_SIGNAL)
+        mark.create_line(16, 21, 16, 32, fill=FG_SIGNAL)
+        mark.create_line(0, 16, 11, 16, fill=FG_SIGNAL)
+        mark.create_line(21, 16, 32, 16, fill=FG_SIGNAL)
+        mark.create_oval(14, 14, 18, 18, outline=FG_SIGNAL, fill=FG_SIGNAL)
+        ctk.CTkLabel(rail, text="Session Sorter", text_color=FG_TEXT,
+                     font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=17)
+        ctk.CTkLabel(rail, text="ASIAIR  /  " + VERSION, text_color=FG_MUTED,
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=17, pady=(0,22))
 
-        # ── Tab view ──────────────────────────────────────────────────
-        tabs = ctk.CTkTabview(self, fg_color=BG_APP,
-                               segmented_button_fg_color=BG_CARD,
-                               segmented_button_selected_color=ACCENT,
-                               segmented_button_selected_hover_color=ACCENT_HL,
-                               segmented_button_unselected_color=BG_CARD,
-                               segmented_button_unselected_hover_color=BTN_MOVE,
-                               text_color=FG_TEXT,
-                               text_color_disabled=FG_MUTED)
-        tabs.pack(fill="both", expand=True, padx=14, pady=(8,12))
-        tabs.add("Sort Files")
-        tabs.add("Library")
-        tabs.add("PHD2 Viewer")
+        main = ctk.CTkFrame(self, fg_color="transparent")
+        main.pack(side="left", fill="both", expand=True, padx=20, pady=(16,16))
+        self._heading = ctk.CTkLabel(main, text="", text_color=FG_TEXT,
+                                     font=ctk.CTkFont(size=28, weight="bold"), anchor="w")
+        self._heading.pack(fill="x")
+        self._description = ctk.CTkLabel(main, text="", text_color=FG_MUTED, anchor="w",
+                                         font=ctk.CTkFont(size=13))
+        self._description.pack(fill="x", pady=(0,11))
+        pages = ctk.CTkFrame(main, fg_color="transparent")
+        pages.pack(fill="both", expand=True)
+        pages.grid_rowconfigure(0, weight=1)
+        pages.grid_columnconfigure(0, weight=1)
 
-        self.library = LibraryFrame(tabs.tab("Library"), self.catalog)
-        self.library.pack(fill="both", expand=True)
-        viewer = PHD2ViewerFrame(tabs.tab("PHD2 Viewer"), self.catalog)
+        self.library = LibraryFrame(pages, self.catalog)
+        viewer = PHD2ViewerFrame(pages, self.catalog)
         def sorted_complete():
             viewer.refresh_library(auto_load=True)
             self.library.scan_configured()
-        SortFrame(tabs.tab("Sort Files"),
-                  on_complete=sorted_complete, catalog=self.catalog).pack(
-                      fill="both", expand=True)
-        viewer.pack(fill="both", expand=True)
+        sorter = SortFrame(pages, on_complete=sorted_complete, catalog=self.catalog)
+        self._pages = {
+            "Import": (sorter, "Import captures", "Preview the folder plan, then verify copies before ejecting."),
+            "Library": (self.library, "Astrophotography library", "Browse sessions, assess lights, and track your archive."),
+            "PHD2 Guiding": (viewer, "PHD2 guiding", "Review guide logs, correction pulses, and dithers."),
+        }
+        self._nav = {}
+        for name, (page, _, _) in self._pages.items():
+            page.grid(row=0, column=0, sticky="nsew")
+            button = ctk.CTkButton(rail, text=name, anchor="w", height=39, border_spacing=10,
+                                   command=lambda n=name: self._show_page(n))
+            button.pack(fill="x", padx=9, pady=3)
+            self._nav[name] = button
+        self._show_page("Import")
+
+    def _show_page(self, name):
+        page, heading, description = self._pages[name]
+        page.tkraise()
+        self._heading.configure(text=heading)
+        self._description.configure(text=description)
+        for key, button in self._nav.items():
+            button.configure(fg_color=BTN_MOVE if key == name else "transparent",
+                             hover_color=BORDER if key == name else BTN_MOVE,
+                             text_color=FG_SIGNAL if key == name else FG_MUTED)
 
     def _close(self):
         self.library.shutdown()

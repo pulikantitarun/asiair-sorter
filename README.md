@@ -30,6 +30,8 @@ PixInsight masters, tracks storage and imaging progress, and analyses PHD2 logs.
 - **PHD2 log viewer** — load any PHD2 guide log and see interactive RA/Dec error graphs, star SNR, dither markers, and per-session RMS/peak-error stats
 - **Automatic PHD2 log library** — copies new or changed guide/debug logs from the remembered ASIAIR source, refreshes every 60 seconds, and opens the newest guide log automatically
 - **Detailed guiding analysis** — equipment, algorithms, sky position, RMS/median/P95/peak error, drift, correction pulses, cadence, dithers, SNR, star mass, HFD, lost-star reasons, and session events
+- **Guiding timeline and Star Plot** — zoom or drag across the full-night overview, jump to guide events, and inspect the same time window as RA/Dec offsets around the lock point
+- **Next Session** — one recommended check with evidence from the guide log and a way to compare the next run; does not change mount settings
 - **Copy and verify only** — source and destination SHA-256 hashes must match; raw FITS files are never removed automatically
 - **Dry run** — preview every action before touching a single file
 - **Dark themed UI** — built with customtkinter
@@ -59,10 +61,10 @@ PixInsight masters, tracks storage and imaging progress, and analyses PHD2 logs.
 Pre-built downloads are available for Windows, macOS and Linux from the
 [latest release](https://github.com/pulikantitarun/asiair-sorter/releases/latest).
 
-- **Windows:** use `ASIAIR_Sorter_Setup_v3.1.exe`. It replaces an older
+- **Windows:** use `ASIAIR_Sorter_Setup_v3.2.exe`. It replaces an older
   installation in place while retaining saved source/destination settings.
-- **macOS:** unzip `ASIAIR_Sorter_macOS_v3.1.zip`, then open the app bundle.
-- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v3.1.tar.gz`, make the binary
+- **macOS:** unzip `ASIAIR_Sorter_macOS_v3.2.zip`, then open the app bundle.
+- **Linux:** extract `ASIAIR_Sorter_Linux_x86_64_v3.2.tar.gz`, make the binary
   executable if required, and run `ASIAIR_Sorter`.
 
 ### Pre-built Windows installer (recommended)

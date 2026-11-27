@@ -3,7 +3,7 @@
 ; ============================================================
 
 #define AppName      "ASIAIR Session Sorter"
-#define AppVersion   "3.1"
+#define AppVersion   "3.2"
 #define AppPublisher "pulikantitarun"
 #define AppExeName   "ASIAIR_Sorter.exe"
 
@@ -101,8 +101,7 @@ begin
     'This will install ' + ExpandConstant('{#AppName}') + ' ' +
     ExpandConstant('{#AppVersion}') + ' on your computer.' + #13#10 + #13#10 +
     'ASIAIR Session Sorter organises your Asiair SD card data into a ' +
-    'clean folder structure — sorting FITS frames by date, target and ' +
-    'filter, removing preview JPGs from the SD card, and placing PHD2 ' +
-    'guide logs alongside each session.' + #13#10 + #13#10 +
+    'date, camera and target folder structure, verifies copied FITS files, ' +
+    'and helps you review PHD2 guiding and plan your next session.' + #13#10 + #13#10 +
     'Click Next to continue.';
 end;
